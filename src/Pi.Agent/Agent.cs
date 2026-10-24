@@ -10,10 +10,12 @@ namespace Pi.Agent;
 /// </summary>
 public sealed class Agent
 {
-    private readonly List<ChatMessage> _messages = [];
+    private ChatMessage[] _messages = [];
+    private readonly Lock _messagesGate = new();
     private readonly List<AgentTool> _tools = [];
     private readonly HashSet<string> _pendingToolCalls = [];
-    private readonly List<Func<AgentEvent, CancellationToken, Task>> _listeners = [];
+    private Subscription[] _subscriptions = [];
+    private readonly Lock _subscriptionsGate = new();
 
     private readonly PendingMessageQueue _steeringQueue;
     private readonly PendingMessageQueue _followUpQueue;
@@ -52,11 +54,12 @@ public sealed class Agent
 
         // TS createMutableAgentState：初始 transcript 先就位，再把 prompt / 工具折成前导
         // system 消息——仅当 transcript 不以 system 消息开头时插入（messages.unshift）。
-        _messages.AddRange(options.Messages ?? []);
+        var initialMessages = new List<ChatMessage>(options.Messages ?? []);
         var initialMessage = Pi.Ai.Utils.Transcript.CreateInitialSystemMessage(
             options.SystemPrompt, _tools.Select(t => t.Definition).ToList());
-        if (initialMessage is not null && (_messages.Count == 0 || _messages[0] is not SystemMessage))
-            _messages.Insert(0, initialMessage);
+        if (initialMessage is not null && (initialMessages.Count == 0 || initialMessages[0] is not SystemMessage))
+            initialMessages.Insert(0, initialMessage);
+        _messages = [.. initialMessages];
     }
 
     /// <summary>默认消息转换：保留全部四种标准角色消息（对齐 TS defaultConvertToLlm）。</summary>
@@ -69,8 +72,17 @@ public sealed class Agent
     /// <remarks>
     /// 赋值替换整个集合。TS 的 <c>agent.state.messages = …</c> 是会话投影（4e-3e-9h-2c 的
     /// <c>_refreshFinalizedContext</c>）与请求投影的写入点；与 <see cref="Tools"/> 同款语义。
+    /// <para>读到的是当时的不可变快照（写时复制）：agent 线程在运行中追加消息，UI / RPC 线程随时读取，
+    /// 两边互不干扰，也不会出现「Collection was modified」。</para>
     /// </remarks>
-    public IReadOnlyList<ChatMessage> Messages { get => _messages; set { _messages.Clear(); _messages.AddRange(value); } }
+    public IReadOnlyList<ChatMessage> Messages
+    {
+        get => Volatile.Read(ref _messages);
+        set
+        {
+            lock (_messagesGate) _messages = [.. value];
+        }
+    }
 
     /// <summary>当前使用的模型。</summary>
     public Model Model { get => _model; set => _model = value; }
@@ -158,14 +170,30 @@ public sealed class Agent
     /// </summary>
     public IDisposable Subscribe(Func<AgentEvent, CancellationToken, Task> listener)
     {
-        _listeners.Add(listener);
-        return new Unsubscriber(_listeners, listener);
+        var subscription = new Subscription(this, listener);
+        lock (_subscriptionsGate) _subscriptions = [.. _subscriptions, subscription];
+        return subscription;
     }
 
-    private sealed class Unsubscriber(List<Func<AgentEvent, CancellationToken, Task>> listeners,
-        Func<AgentEvent, CancellationToken, Task> listener) : IDisposable
+    /// <summary>
+    /// 一次订阅。订阅表写时复制：分发遍历当时的数组，监听器在回调里退订（一次性监听器）或别的
+    /// 线程订阅/退订都不会打断本轮遍历；本轮中途被退订的监听器跳过（对齐 TS 遍历 live Set）。
+    /// 退订按订阅对象而非委托识别，重复 Dispose 不会误删同一委托的另一次订阅。
+    /// </summary>
+    private sealed class Subscription(Agent agent, Func<AgentEvent, CancellationToken, Task> listener) : IDisposable
     {
-        public void Dispose() => listeners.Remove(listener);
+        private int _disposed;
+
+        public Func<AgentEvent, CancellationToken, Task> Listener { get; } = listener;
+
+        public bool IsDisposed => Volatile.Read(ref _disposed) != 0;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            lock (agent._subscriptionsGate)
+                agent._subscriptions = Array.FindAll(agent._subscriptions, s => !ReferenceEquals(s, this));
+        }
     }
 
     // ---------- 队列 API ----------
@@ -225,9 +253,11 @@ public sealed class Agent
             throw new InvalidOperationException("Agent is already processing. Wait for completion before resetting.");
 
         // TS reset()：把全部 system 消息回放成一条基线（而非取第一条）。
-        var baseline = Pi.Ai.Utils.Transcript.GetCurrentSystemMessage(_messages);
-        _messages.Clear();
-        if (baseline is not null) _messages.Add(baseline);
+        lock (_messagesGate)
+        {
+            var baseline = Pi.Ai.Utils.Transcript.GetCurrentSystemMessage(_messages);
+            _messages = baseline is null ? [] : [baseline];
+        }
         _isStreaming = false;
         _streamingMessage = null;
         _pendingToolCalls.Clear();
@@ -261,8 +291,9 @@ public sealed class Agent
         if (_activeRun is not null)
             throw new InvalidOperationException("Agent is already processing. Wait for completion before continuing.");
 
-        var lastMessage = _messages.LastOrDefault();
-        if (lastMessage is null || _messages.All(m => m is SystemMessage))
+        var messages = Messages;
+        var lastMessage = messages.LastOrDefault();
+        if (lastMessage is null || messages.All(m => m is SystemMessage))
             throw new InvalidOperationException("No messages to continue from");
 
         if (lastMessage is AssistantMessage)
@@ -424,7 +455,7 @@ public sealed class Agent
 
             case AgentEvent.MessageEnd end:
                 _streamingMessage = null;
-                _messages.Add(end.Message);
+                lock (_messagesGate) _messages = [.. _messages, end.Message];
                 break;
 
             case AgentEvent.ToolExecutionStart toolStart:
@@ -448,28 +479,45 @@ public sealed class Agent
         if (_activeRun is null)
             throw new InvalidOperationException("Agent listener invoked outside active run");
         var signal = _activeRun.AbortController.Token;
-        foreach (var listener in _listeners)
-            await listener(@event, signal).ConfigureAwait(false);
+        // 写时复制的订阅表：遍历不加锁、不分配（MessageUpdate 每个流式增量都走这里）。
+        foreach (var subscription in Volatile.Read(ref _subscriptions))
+        {
+            if (subscription.IsDisposed) continue;
+            await subscription.Listener(@event, signal).ConfigureAwait(false);
+        }
     }
 }
 
 /// <summary>待处理消息队列。对应 TS <c>PendingMessageQueue</c>：
-/// all 模式一次排空全部，one-at-a-time 每次只投递最旧的一条。</summary>
+/// all 模式一次排空全部，one-at-a-time 每次只投递最旧的一条。
+/// UI 线程入队（steer / followUp）与 agent 线程排空并发发生，故各操作加锁。</summary>
 public sealed class PendingMessageQueue(QueueMode mode)
 {
     private readonly List<ChatMessage> _messages = [];
+    private readonly Lock _gate = new();
 
     /// <summary>排空模式。</summary>
     public QueueMode Mode { get; set; } = mode;
 
     /// <summary>入队一条消息。</summary>
-    public void Enqueue(ChatMessage message) => _messages.Add(message);
+    public void Enqueue(ChatMessage message)
+    {
+        lock (_gate) _messages.Add(message);
+    }
 
     /// <summary>队列非空。</summary>
-    public bool HasItems() => _messages.Count > 0;
+    public bool HasItems()
+    {
+        lock (_gate) return _messages.Count > 0;
+    }
 
     /// <summary>预览将被选取的消息（不消费）。</summary>
     public IReadOnlyList<ChatMessage> Peek()
+    {
+        lock (_gate) return PeekUnlocked();
+    }
+
+    private IReadOnlyList<ChatMessage> PeekUnlocked()
     {
         if (Mode == QueueMode.All) return [.. _messages];
         return _messages.Count > 0 ? [_messages[0]] : [];
@@ -478,11 +526,17 @@ public sealed class PendingMessageQueue(QueueMode mode)
     /// <summary>排空并移除被选取的消息。</summary>
     public IReadOnlyList<ChatMessage> Drain()
     {
-        var drained = Peek();
-        _messages.RemoveRange(0, drained.Count);
-        return drained;
+        lock (_gate)
+        {
+            var drained = PeekUnlocked();
+            _messages.RemoveRange(0, drained.Count);
+            return drained;
+        }
     }
 
     /// <summary>清空队列。</summary>
-    public void Clear() => _messages.Clear();
+    public void Clear()
+    {
+        lock (_gate) _messages.Clear();
+    }
 }

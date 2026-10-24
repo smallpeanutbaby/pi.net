@@ -9,6 +9,9 @@ namespace Pi.Agent;
 /// </summary>
 public static partial class AgentLoop
 {
+    /// <summary>中止后等待 provider 发出 Error(Aborted) 终态事件的宽限（见 <c>StreamAssistantResponse</c>）。</summary>
+    private static readonly TimeSpan AbortGracePeriod = TimeSpan.FromSeconds(5);
+
     /// <summary>
     /// 主循环（agentLoop 与 agentLoopContinue 共享）。
     /// 外层循环：agent 本应停止时若有 follow-up 消息则继续；
@@ -311,7 +314,13 @@ public static partial class AgentLoop
         AssistantMessage RecordThinkingLevel(AssistantMessage message)
             => message with { ThinkingLevel = config.Reasoning ?? ThinkingLevel.Off };
 
-        await foreach (var @event in response.WithCancellation(signal).ConfigureAwait(false))
+        // TS：`for await (const event of response)` 不与 signal 竞速——中止时由 provider 发出带部分内容的
+        // Error(Aborted) 终态事件，循环据此收尾，已流式输出的文本得以保留。端口只留一道宽限：
+        // provider 若违反契约在中止后迟迟不收口，宽限到期后沿取消路径退出。
+        using var abortGrace = new CancellationTokenSource();
+        using var abortGraceArming = signal.UnsafeRegister(
+            static state => ((CancellationTokenSource)state!).CancelAfter(AbortGracePeriod), abortGrace);
+        await foreach (var @event in response.WithCancellation(abortGrace.Token).ConfigureAwait(false))
         {
             switch (@event)
             {

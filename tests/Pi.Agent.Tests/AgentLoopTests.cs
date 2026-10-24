@@ -325,6 +325,232 @@ public class AgentLoopTests
         Assert.Contains("output token limit", ((TextContent)first.Content[0]).Text);
     }
 
+    [Theory]
+    [InlineData(ToolExecutionMode.Sequential)]
+    [InlineData(ToolExecutionMode.Parallel)]
+    public async Task ToolInternalCancellationIsAToolError(ToolExecutionMode mode)
+    {
+        // 工具内部超时（如 HttpClient.Timeout）抛 TaskCanceledException，但运行本身没有被中止：
+        // 与其他异常一样落成错误结果交给模型（TS 同款），而不是把整次运行打成 error。
+        var streamFn = Faux.CreateStreamFn([
+            Faux.Response.ToolUse(Faux.ToolCall("fetch", null, id: "call-1")),
+            Faux.Response.Text("recovered"),
+        ]);
+        var fetchTool = new AgentTool(
+            Name: "fetch",
+            Description: "内部超时的测试工具",
+            Parameters: new ToolSchema(new Dictionary<string, object?> { ["type"] = "object" }),
+            Label: "Fetch",
+            Execute: (_, _, _, _) => throw new TaskCanceledException("HttpClient.Timeout elapsed"));
+        var context = new AgentContext { Messages = [], Tools = [fetchTool] };
+        var config = CreateConfig(Faux.DefaultModel) with { ToolExecution = mode };
+
+        var stream = AgentLoop.Run(
+            [Messages.UserText("go")], context, config, CancellationToken.None, streamFn);
+        var result = await stream.WaitForResultAsync();
+
+        // system + user + assistant(toolUse) + toolResult(错误) + assistant(recovered)。
+        Assert.Equal(5, result.Count);
+        var toolResult = Assert.IsType<ToolResultMessage>(result[3]);
+        Assert.True(toolResult.IsError);
+        Assert.Contains("HttpClient.Timeout elapsed", ((TextContent)toolResult.Content[0]).Text);
+        Assert.Equal(StopReason.Stop, Assert.IsType<AssistantMessage>(result[4]).StopReason);
+    }
+
+    [Theory]
+    [InlineData(ToolExecutionMode.Sequential)]
+    [InlineData(ToolExecutionMode.Parallel)]
+    public async Task AbortDuringToolExecutionPropagatesUnwrapped(ToolExecutionMode mode)
+    {
+        // 真正的中止仍沿取消路径传播；并行模式下也不能被包成 AggregateException。
+        var streamFn = Faux.CreateStreamFn([
+            Faux.Response.ToolUse(Faux.ToolCall("wait", null, id: "call-1")),
+            Faux.Response.Text("unreachable"),
+        ]);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var waitTool = new AgentTool(
+            Name: "wait",
+            Description: "等待中止的测试工具",
+            Parameters: new ToolSchema(new Dictionary<string, object?> { ["type"] = "object" }),
+            Label: "Wait",
+            Execute: async (_, _, signal, _) =>
+            {
+                started.TrySetResult();
+                await Task.Delay(Timeout.Infinite, signal);
+                return new AgentToolResult([new TextContent("unreachable")]);
+            });
+        var context = new AgentContext { Messages = [], Tools = [waitTool] };
+        var config = CreateConfig(Faux.DefaultModel) with { ToolExecution = mode };
+        using var abort = new CancellationTokenSource();
+
+        var stream = AgentLoop.Run(
+            [Messages.UserText("go")], context, config, abort.Token, streamFn);
+        // 有截止时间：工具若因回归根本没被调用，测试应失败而不是挂死。
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await abort.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => stream.WaitForResultAsync());
+    }
+
+    /// <summary>
+    /// 遵守 StreamFn 契约的「卡住直到中止」脚本：先流出一段文本，然后等待取消，
+    /// 中止时发出带部分内容的 Error(Aborted) 终态事件（真实 provider 与 Faux 同款）。
+    /// </summary>
+    private static StreamFn HangingStreamFn(string partialText, TaskCompletionSource started)
+        => (model, _, _, ct) =>
+        {
+            var stream = new AssistantMessageEventStream();
+            _ = Task.Run(async () =>
+            {
+                var partial = new AssistantMessage([new TextContent("")], StopReason.Stop,
+                    UsageStats: new Usage(0, 0), Model: model.Id, Api: model.Api, Provider: model.Provider,
+                    Timestamp: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                stream.Push(new AssistantMessageEvent.Start(partial));
+                partial = partial with { Content = [new TextContent(partialText)] };
+                stream.Push(new AssistantMessageEvent.TextDelta(0, partialText, 0, partial));
+                started.TrySetResult();
+                try
+                {
+                    await Task.Delay(Timeout.Infinite, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                }
+                var aborted = partial with { StopReason = StopReason.Aborted, ErrorMessage = "Request was aborted" };
+                stream.Push(new AssistantMessageEvent.Error(StopReason.Aborted, "Request was aborted", aborted));
+                stream.End(aborted);
+            }, CancellationToken.None);
+            return Task.FromResult<IAssistantMessageEventStream>(stream);
+        };
+
+    [Fact]
+    public async Task AbortMidStreamKeepsThePartialMessage()
+    {
+        // TS：循环不与 signal 竞速，由 provider 发出带部分内容的 Error(Aborted) 终态事件；
+        // 已流式输出的文本保留在最终消息里，MessageEnd / TurnEnd / AgentEnd 照常发出。
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var context = new AgentContext { Messages = [] };
+        var config = CreateConfig(Faux.DefaultModel);
+        using var abort = new CancellationTokenSource();
+
+        var stream = AgentLoop.Run(
+            [Messages.UserText("hi")], context, config, abort.Token, HangingStreamFn("Here is half", started));
+        var eventsTask = Subscribe(stream);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await abort.CancelAsync();
+        var result = await stream.WaitForResultAsync();
+        var events = await eventsTask;
+
+        var assistant = Assert.IsType<AssistantMessage>(result[^1]);
+        Assert.Equal(StopReason.Aborted, assistant.StopReason);
+        Assert.Equal("Here is half", ((TextContent)assistant.Content[0]).Text);
+        Assert.Contains(events, e => e is AgentEvent.MessageEnd { Message: AssistantMessage { StopReason: StopReason.Aborted } });
+        Assert.IsType<AgentEvent.AgentEnd>(events[^1]);
+    }
+
+    [Fact]
+    public async Task ParallelHookFailureCancelsAndAwaitsSiblingTools()
+    {
+        // 并行批里一个调用的 afterToolCall 抛错：其余调用被取消并等到退出后，原异常才抛给上层——
+        // 不留下在运行结束后还在发事件的孤儿工具。
+        var streamFn = Faux.CreateStreamFn([
+            new Faux.Response(
+                [Faux.ToolCall("slow", null, id: "call-1"), Faux.ToolCall("echo", null, id: "call-2")],
+                StopReason.ToolUse),
+            Faux.Response.Text("unreachable"),
+        ]);
+        var slowCancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var slowTool = new AgentTool(
+            Name: "slow",
+            Description: "等待中止的测试工具",
+            Parameters: new ToolSchema(new Dictionary<string, object?> { ["type"] = "object" }),
+            Label: "Slow",
+            Execute: async (_, _, signal, _) =>
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(30), signal);
+                }
+                catch (OperationCanceledException)
+                {
+                    slowCancelled.TrySetResult();
+                    throw;
+                }
+                return new AgentToolResult([new TextContent("unreachable")]);
+            });
+        var context = new AgentContext { Messages = [], Tools = [slowTool, CreateEchoTool()] };
+        var config = CreateConfig(Faux.DefaultModel) with
+        {
+            ToolExecution = ToolExecutionMode.Parallel,
+            AfterToolCall = (hookContext, _) => hookContext.ToolCall.Name == "echo"
+                ? throw new InvalidOperationException("hook boom")
+                : Task.FromResult<AfterToolCallResult?>(null),
+        };
+
+        var stream = AgentLoop.Run(
+            [Messages.UserText("go")], context, config, CancellationToken.None, streamFn);
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => stream.WaitForResultAsync().WaitAsync(TimeSpan.FromSeconds(10)));
+
+        Assert.Equal("hook boom", error.Message);
+        // 原异常抛出时，慢工具已经观察到取消并退出。
+        Assert.True(slowCancelled.Task.IsCompleted);
+    }
+
+    [Fact]
+    public async Task ParallelToolEventsAreNeverDispatchedConcurrently()
+    {
+        // 两个并行工具各自从自己的线程高频发 onUpdate：监听器一次只被一个事件进入（TS 单线程契约）。
+        var streamFn = Faux.CreateStreamFn([
+            new Faux.Response(
+                [Faux.ToolCall("chatty", null, id: "call-1"), Faux.ToolCall("chatty", null, id: "call-2")],
+                StopReason.ToolUse),
+            Faux.Response.Text("done"),
+        ]);
+        var chattyTool = new AgentTool(
+            Name: "chatty",
+            Description: "高频进度回调的测试工具",
+            Parameters: new ToolSchema(new Dictionary<string, object?> { ["type"] = "object" }),
+            Label: "Chatty",
+            Execute: async (_, _, _, onUpdate) =>
+            {
+                for (var i = 0; i < 200; i++)
+                {
+                    if (onUpdate is not null) await onUpdate(new AgentToolResult([new TextContent($"step {i}")]));
+                }
+                return new AgentToolResult([new TextContent("ok")]);
+            });
+        var context = new AgentContext { Messages = [], Tools = [chattyTool] };
+        var config = CreateConfig(Faux.DefaultModel) with { ToolExecution = ToolExecutionMode.Parallel };
+
+        var inFlight = 0;
+        var maxInFlight = 0;
+        var updates = 0;
+        AgentEventSink emit = async @event =>
+        {
+            var now = Interlocked.Increment(ref inFlight);
+            InterlockedMax(ref maxInFlight, now);
+            if (@event is AgentEvent.ToolExecutionUpdate) Interlocked.Increment(ref updates);
+            await Task.Yield();
+            Interlocked.Decrement(ref inFlight);
+        };
+
+        await AgentLoop.RunWithPrompts(
+            [Messages.UserText("go")], context, config, emit, CancellationToken.None, streamFn);
+
+        Assert.Equal(400, updates);
+        Assert.Equal(1, maxInFlight);
+    }
+
+    private static void InterlockedMax(ref int location, int value)
+    {
+        int current;
+        while ((current = Volatile.Read(ref location)) < value
+               && Interlocked.CompareExchange(ref location, value, current) != current)
+        {
+        }
+    }
+
     [Fact]
     public async Task SteeringMessagesInjectMidRun()
     {

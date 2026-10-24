@@ -32,9 +32,54 @@ public static partial class ToolExecution
         var hasSequentialToolCall = toolCalls.Any(tc =>
             (context.Tools ?? []).Any(t => t.Name == tc.Name && t.ExecutionMode == ToolExecutionMode.Sequential));
 
+        // TS 单线程：事件在流里排队、监听器从不并发运行。端口里工具的 onUpdate 来自各自的线程
+        // （并行模式的 Task.Run、bash 工具的定时器与管道线程），会与主循环的 end 事件同时打到
+        // 监听器——整批共用一把门，事件逐个分发，恢复「监听器不会被并发调用」的契约。
+        var serialEmit = SerializeSink(emit);
+
         if (config.ToolExecution == ToolExecutionMode.Sequential || hasSequentialToolCall)
-            return await ExecuteSequential(context, assistantMessage, toolCalls, config, signal, emit).ConfigureAwait(false);
-        return await ExecuteParallel(context, assistantMessage, toolCalls, config, signal, emit).ConfigureAwait(false);
+            return await ExecuteSequential(context, assistantMessage, toolCalls, config, signal, serialEmit).ConfigureAwait(false);
+        return await ExecuteParallel(context, assistantMessage, toolCalls, config, signal, serialEmit).ConfigureAwait(false);
+    }
+
+    /// <summary>把事件槽包成一次只放行一个事件的串行槽（见 <see cref="ExecuteToolCalls"/>）。</summary>
+    private static AgentEventSink SerializeSink(AgentEventSink emit)
+    {
+        var gate = new SemaphoreSlim(1, 1);
+        return async @event =>
+        {
+            await gate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                await emit(@event).ConfigureAwait(false);
+            }
+            finally
+            {
+                gate.Release();
+            }
+        };
+    }
+
+    /// <summary>
+    /// 并行模式下 afterToolCall 同样串行化：TS 的 finalize 在单线程上逐个 await，钩子体从不重叠；
+    /// 端口的工具各自跑在 Task.Run 上，钩子（扩展的 tool_result 处理、图片归一化）会真正并发。
+    /// </summary>
+    private static Func<AfterToolCallContext, CancellationToken, Task<AfterToolCallResult?>> SerializeHook(
+        Func<AfterToolCallContext, CancellationToken, Task<AfterToolCallResult?>> hook)
+    {
+        var gate = new SemaphoreSlim(1, 1);
+        return async (hookContext, signal) =>
+        {
+            await gate.WaitAsync(signal).ConfigureAwait(false);
+            try
+            {
+                return await hook(hookContext, signal).ConfigureAwait(false);
+            }
+            finally
+            {
+                gate.Release();
+            }
+        };
     }
 
     /// <summary>
@@ -71,8 +116,9 @@ public static partial class ToolExecution
     }
 
     /// <summary>
-    /// <see cref="ExecutePrepared"/> 的 onUpdate 直通变体：<see cref="RunToolCallAsync"/>
-    /// 不经过事件槽，流式增量按 TS 的 <c>onUpdate</c> 回调转发。
+    /// 执行已预检的工具调用，onUpdate 直通给调用方：<see cref="RunToolCallAsync"/>
+    /// 不经过事件槽，流式增量按 TS 的 <c>onUpdate</c> 回调转发；<see cref="ExecutePrepared"/>
+    /// 在此之上把增量包成事件。
     /// </summary>
     private static async Task<ExecutedToolResult> ExecutePreparedAsync(
         PreparedCall.Ready prepared,
@@ -88,9 +134,10 @@ public static partial class ToolExecution
                 prepared.ToolCall.Id, prepared.Args, signal, onUpdate).ConfigureAwait(false);
             return new ExecutedToolResult(result, Elapsed());
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (signal.IsCancellationRequested)
         {
-            // 中止沿取消路径传播（由上层运行决定退出方式）。
+            // 中止沿取消路径传播（由上层运行决定退出方式）。工具自身的超时
+            // （如 HttpClient.Timeout）不是中止，落入下方的失败结果分支。
             throw;
         }
         catch (Exception error)
@@ -190,6 +237,14 @@ public static partial class ToolExecution
         }
 
         // 阶段二：并行执行通过预检的调用（blocked 结果直接作为产出）。
+        // 整批共用一个联动的取消源：某个调用失败（钩子抛错等）时，TS 的 Promise.all 让其余调用在后台
+        // 跑完即可；端口里它们会在运行结束后继续发事件、调钩子（"listener invoked outside active run"），
+        // 故先取消并等其余调用退出，再把原异常抛给上层。
+        using var batch = CancellationTokenSource.CreateLinkedTokenSource(signal);
+        var batchSignal = batch.Token;
+        var parallelConfig = config.AfterToolCall is null
+            ? config
+            : config with { AfterToolCall = SerializeHook(config.AfterToolCall) };
         var tasks = new List<Task<(int Index, AgentToolCallOutcome Outcome)>>();
         for (var index = 0; index < prepared.Count; index++)
         {
@@ -202,7 +257,7 @@ public static partial class ToolExecution
                     PreparedCall.Blocked blocked => new AgentToolCallOutcome(
                         blocked.ToolCall, blocked.Result, blocked.Result.IsError),
                     PreparedCall.Ready ready => await ExecuteAndFinalize(
-                        ready, context, assistantMessage, config, signal, emit).ConfigureAwait(false),
+                        ready, context, assistantMessage, parallelConfig, batchSignal, emit).ConfigureAwait(false),
                     _ => throw new InvalidOperationException("Unknown prepared call"),
                 };
                 return (currentIndex, outcome);
@@ -210,14 +265,34 @@ public static partial class ToolExecution
         }
 
         var completed = new Dictionary<int, AgentToolCallOutcome>();
-        await foreach (var finished in Task.WhenEach(tasks).ConfigureAwait(false))
+        try
         {
-            var (index, outcome) = finished.Result;
-            completed[index] = outcome;
-            // end 事件按完成序发出（对齐 TS 的完成顺序语义）。
-            await emit(new AgentEvent.ToolExecutionEnd(
-                outcome.ToolCall.Id, outcome.ToolCall.Name, outcome.Result, outcome.IsError, outcome.DurationMs))
-                .ConfigureAwait(false);
+            await foreach (var finished in Task.WhenEach(tasks).ConfigureAwait(false))
+            {
+                // await 而非 .Result：失败/取消按原异常抛出，不包成 AggregateException。
+                var (index, outcome) = await finished.ConfigureAwait(false);
+                completed[index] = outcome;
+                // end 事件按完成序发出（对齐 TS 的完成顺序语义）。
+                await emit(new AgentEvent.ToolExecutionEnd(
+                    outcome.ToolCall.Id, outcome.ToolCall.Name, outcome.Result, outcome.IsError, outcome.DurationMs))
+                    .ConfigureAwait(false);
+            }
+        }
+        catch
+        {
+            await batch.CancelAsync().ConfigureAwait(false);
+            foreach (var task in tasks)
+            {
+                try
+                {
+                    await task.ConfigureAwait(false);
+                }
+                catch
+                {
+                    // 其余调用的退出异常不覆盖原异常。
+                }
+            }
+            throw;
         }
 
         // 阶段三：tool-result 消息按助手消息源顺序合成并发出。
@@ -327,35 +402,17 @@ public static partial class ToolExecution
     /// <summary>执行结果 + 单调时钟测得的耗时（毫秒）。对应 TS <c>ExecutedToolCallOutcome</c>。</summary>
     private sealed record ExecutedToolResult(AgentToolResult Result, long DurationMs);
 
-    /// <summary>执行已预检的工具调用（onUpdate 转发为 tool_execution_update 事件）。</summary>
-    private static async Task<ExecutedToolResult> ExecutePrepared(
+    /// <summary>
+    /// 执行已预检的工具调用：onUpdate 转发为 tool_execution_update 事件（对齐 TS 的
+    /// emitToolExecutionUpdate），其余与 <see cref="ExecutePreparedAsync"/> 共用一条路径。
+    /// </summary>
+    private static Task<ExecutedToolResult> ExecutePrepared(
         PreparedCall.Ready prepared,
         CancellationToken signal,
         AgentEventSink emit)
-    {
-        var startedAt = Stopwatch.GetTimestamp();
-        long Elapsed() => (long)Math.Round(Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds);
-
-        try
-        {
-            // onUpdate 转发为 tool_execution_update 事件（对齐 TS 的 emitToolExecutionUpdate）。
-            AgentToolUpdateCallback? onUpdate = partial =>
-                emit(new AgentEvent.ToolExecutionUpdate(
-                    prepared.ToolCall.Id, prepared.ToolCall.Name, prepared.Args, partial));
-            var result = await prepared.Tool.Execute(prepared.ToolCall.Id, prepared.Args, signal, onUpdate).ConfigureAwait(false);
-            return new ExecutedToolResult(result, Elapsed());
-        }
-        catch (OperationCanceledException)
-        {
-            // 中止沿取消路径传播（由上层运行决定退出方式）。
-            throw;
-        }
-        catch (Exception error)
-        {
-            // 抛出的错误视为失败结果（模型可见文本，UI 可读异常）。
-            return new ExecutedToolResult(AgentToolResult.FromError(error.Message), Elapsed());
-        }
-    }
+        => ExecutePreparedAsync(prepared, signal, partial =>
+            emit(new AgentEvent.ToolExecutionUpdate(
+                prepared.ToolCall.Id, prepared.ToolCall.Name, prepared.Args, partial)));
 
     /// <summary>应用 afterToolCall 覆盖并产出最终结果。对应 TS <c>finalizeExecutedToolCall</c>。</summary>
     private static async Task<AgentToolCallOutcome> Finalize(

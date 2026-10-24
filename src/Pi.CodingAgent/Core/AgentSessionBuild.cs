@@ -118,7 +118,8 @@ public partial class AgentSession
 
     // Event subscription state
     private IDisposable? _unsubscribeAgent;                 // 9h-3 接线
-    private readonly List<AgentSessionEventListener> _eventListeners = [];
+    private ListenerSubscription[] _eventListeners = [];
+    private readonly Lock _eventListenersGate = new();
     private bool _isAgentRunActive;
     private bool _agentRunAbortRequested;
     private TaskCompletionSource? _idleWaitTcs;
@@ -449,9 +450,14 @@ public partial class AgentSession
     /// <summary>TS <c>_emit(event)</c>。</summary>
     private void Emit(AgentSessionEvent @event)
     {
-        foreach (var listener in _eventListeners)
+        // 写时复制的订阅表：监听器可在回调里退订自己（一次性等待器），UI 线程也可能与 agent 线程
+        // 同时订阅/退订，都不会打断本轮遍历；本轮中途被退订的不再访问（对齐 TS 遍历 live Set）。
+        foreach (var subscription in Volatile.Read(ref _eventListeners))
         {
-            listener(@event);
+            if (!subscription.IsDisposed)
+            {
+                subscription.Listener(@event);
+            }
         }
     }
 
@@ -462,13 +468,44 @@ public partial class AgentSession
     /// <summary>TS <c>subscribe(listener)</c>：返回退订函数。</summary>
     public IDisposable Subscribe(AgentSessionEventListener listener)
     {
-        _eventListeners.Add(listener);
-        return new ListenerUnsubscribe(this, listener);
+        var subscription = new ListenerSubscription(this, listener);
+        lock (_eventListenersGate) _eventListeners = [.. _eventListeners, subscription];
+        return subscription;
     }
 
-    private sealed class ListenerUnsubscribe(AgentSession session, AgentSessionEventListener listener) : IDisposable
+    /// <summary>TS <c>dispose()</c> 里的 <c>_eventListeners = []</c>：全部退订，进行中的 Emit 不再访问它们。</summary>
+    private void ClearEventListeners()
     {
-        public void Dispose() => session._eventListeners.Remove(listener);
+        ListenerSubscription[] cleared;
+        lock (_eventListenersGate)
+        {
+            cleared = _eventListeners;
+            _eventListeners = [];
+        }
+
+        foreach (var subscription in cleared)
+        {
+            subscription.MarkDisposed();
+        }
+    }
+
+    /// <summary>一次订阅：按订阅对象而非委托识别，重复 Dispose 不会误删同一委托的另一次订阅。</summary>
+    private sealed class ListenerSubscription(AgentSession session, AgentSessionEventListener listener) : IDisposable
+    {
+        private int _disposed;
+
+        public AgentSessionEventListener Listener { get; } = listener;
+
+        public bool IsDisposed => Volatile.Read(ref _disposed) != 0;
+
+        public bool MarkDisposed() => Interlocked.Exchange(ref _disposed, 1) == 0;
+
+        public void Dispose()
+        {
+            if (!MarkDisposed()) return;
+            lock (session._eventListenersGate)
+                session._eventListeners = Array.FindAll(session._eventListeners, s => !ReferenceEquals(s, this));
+        }
     }
 
     // =========================================================================

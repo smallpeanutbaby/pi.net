@@ -1361,7 +1361,7 @@ public partial class AgentSession
 
         _extensionRunner.Invalidate(StaleExtensionContextMessage);
         DisconnectFromAgent();
-        _eventListeners.Clear();
+        ClearEventListeners();
         if (_cacheWarmer is not null)
         {
             _cacheWarmer.OnWarmed = null;

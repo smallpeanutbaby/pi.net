@@ -299,6 +299,33 @@ public sealed class AgentSessionBuildTests : IDisposable
     }
 
     [Fact]
+    public async Task Subscribe_ListenerCanUnsubscribeItselfDuringEmit()
+    {
+        // 一次性监听器在回调里退订自己：不影响同一事件的其余监听器，也不抛 "Collection was modified"。
+        var session = await CreateSessionAsync(initialActiveToolNames: []);
+        var onceCalls = 0;
+        IDisposable? once = null;
+        once = session.Subscribe(_ =>
+        {
+            onceCalls++;
+            once!.Dispose();
+        });
+        var events = new List<AgentSessionEvent>();
+        using var subscription = session.Subscribe(events.Add);
+
+        await session.SendCustomMessageAsync(new CustomMessageDraft
+        {
+            CustomType = "note",
+            Content = MessageContent.From("hello"),
+            Display = true,
+        });
+
+        Assert.Equal(1, onceCalls);
+        Assert.Contains(events, e => e is AgentSessionEvent.MessageStartEvent { Message: CustomMessage });
+        Assert.Contains(events, e => e is AgentSessionEvent.MessageEndEvent { Message: CustomMessage });
+    }
+
+    [Fact]
     public async Task SendCustomMessage_NextTurn_IsQueuedNotAppended()
     {
         var session = await CreateSessionAsync(initialActiveToolNames: []);

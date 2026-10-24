@@ -64,6 +64,57 @@ public class AgentTests : IDisposable
     }
 
     [Fact]
+    public async Task ListenerCanUnsubscribeItselfDuringDispatch()
+    {
+        // 一次性监听器在回调里退订自己：不影响同一事件的其余监听器，也不把运行打成 error。
+        var onceCalls = 0;
+        IDisposable? once = null;
+        once = _agent.Subscribe((_, _) =>
+        {
+            onceCalls++;
+            once!.Dispose();
+            return Task.CompletedTask;
+        });
+        var received = new List<AgentEvent>();
+        using var subscription = _agent.Subscribe((@event, _) =>
+        {
+            received.Add(@event);
+            return Task.CompletedTask;
+        });
+
+        await _agent.Prompt("你好");
+
+        Assert.Equal(1, onceCalls);
+        Assert.IsType<AgentEvent.AgentStart>(received[0]);
+        Assert.IsType<AgentEvent.AgentEnd>(received[^1]);
+        Assert.Null(_agent.ErrorMessage);
+        Assert.Equal(StopReason.Stop, Assert.IsType<AssistantMessage>(_agent.Messages[^1]).StopReason);
+    }
+
+    [Fact]
+    public async Task ListenerUnsubscribedByAnEarlierListenerIsSkipped()
+    {
+        // TS 遍历 live Set：前一个监听器在本轮退订了后一个，后一个不再收到这条事件（及之后的）。
+        IDisposable? second = null;
+        var secondCalls = 0;
+        using var first = _agent.Subscribe((_, _) =>
+        {
+            second?.Dispose();
+            return Task.CompletedTask;
+        });
+        second = _agent.Subscribe((_, _) =>
+        {
+            secondCalls++;
+            return Task.CompletedTask;
+        });
+
+        await _agent.Prompt("你好");
+
+        Assert.Equal(0, secondCalls);
+        Assert.Null(_agent.ErrorMessage);
+    }
+
+    [Fact]
     public async Task SteerQueuesMessageForMidRunInjection()
     {
         var script = Faux.CreateStreamFn([Faux.Response.Text("一"), Faux.Response.Text("二")]);
@@ -109,10 +160,10 @@ public class AgentTests : IDisposable
     [Fact]
     public async Task ConcurrentPromptThrows()
     {
-        // 用一个永不结束的脚本让第一次运行保持活动（等待取消）。
+        // 用一个卡住直到中止的脚本让第一次运行保持活动；中止时按 StreamFn 契约发出 Error(Aborted) 终态事件。
         var agent = new Agent(new AgentOptions
         {
-            StreamFn = (_, _, _, ct) =>
+            StreamFn = (model, _, _, ct) =>
             {
                 var stream = new Pi.Ai.Stream.AssistantMessageEventStream();
                 _ = Task.Run(async () =>
@@ -122,6 +173,11 @@ public class AgentTests : IDisposable
                         await Task.Delay(Timeout.Infinite, ct);
                     }
                     catch (OperationCanceledException) { }
+                    var aborted = new AssistantMessage([], StopReason.Aborted, ErrorMessage: "Request was aborted",
+                        UsageStats: new Usage(0, 0), Model: model.Id, Api: model.Api, Provider: model.Provider,
+                        Timestamp: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                    stream.Push(new AssistantMessageEvent.Error(StopReason.Aborted, "Request was aborted", aborted));
+                    stream.End(aborted);
                 }, CancellationToken.None);
                 return Task.FromResult<Pi.Ai.Types.IAssistantMessageEventStream>(stream);
             },
@@ -132,6 +188,20 @@ public class AgentTests : IDisposable
         await Assert.ThrowsAsync<InvalidOperationException>(() => agent.Prompt("第二条"));
         agent.Abort();
         await first;
+        Assert.Equal(StopReason.Aborted, Assert.IsType<AssistantMessage>(agent.Messages[^1]).StopReason);
+    }
+
+    [Fact]
+    public async Task MessagesIsAnImmutableSnapshot()
+    {
+        // 运行前拿到的快照不随后续追加变化：UI / RPC 线程随时读取 Messages 都是一致视图。
+        var before = _agent.Messages;
+        var beforeCount = before.Count;
+
+        await _agent.Prompt("你好");
+
+        Assert.Equal(beforeCount, before.Count);
+        Assert.Equal(beforeCount + 2, _agent.Messages.Count);
     }
 
     [Fact]
