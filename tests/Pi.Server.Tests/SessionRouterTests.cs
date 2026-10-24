@@ -268,6 +268,43 @@ public class SessionRouterTests
     }
 
     [Fact]
+    public async Task PerClientOperationsSubmittedConcurrentlyNeverOverlap()
+    {
+        var harness = new Harness();
+        var handle = harness.AddSession("s1");
+        var running = 0;
+        var overlaps = 0;
+        handle.Attachment.Handler = _ =>
+        {
+            // 调用在串行化的操作里同步启动：两个操作若同时跑到这里，就是尾链被换掉了。
+            if (Interlocked.Increment(ref running) > 1) Interlocked.Increment(ref overlaps);
+            Thread.Sleep(1);
+            Interlocked.Decrement(ref running);
+            return null;
+        };
+        var client = new object();
+        await harness.Router.AttachClientAsync(client, "s1", Ctx);
+        var target = Assert.IsType<RpcTarget.SessionTarget>(Assert.Single(harness.Published).Route);
+
+        var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var submitters = Enumerable.Range(0, 8).Select(_ => Task.Run(async () =>
+        {
+            await start.Task;
+            var calls = new List<Task<object?>>();
+            for (var index = 0; index < 50; index++)
+            {
+                calls.Add(harness.Router.ExecuteServiceCallAsync(Call("m"), target, client, NoPublish, Ctx));
+            }
+            await Task.WhenAll(calls);
+        })).ToArray();
+        start.SetResult();
+        await Task.WhenAll(submitters).WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(400, handle.Attachment.Calls.Count);
+        Assert.Equal(0, overlaps);
+    }
+
+    [Fact]
     public async Task PerClientOperationsRunInOrder()
     {
         var harness = new Harness();

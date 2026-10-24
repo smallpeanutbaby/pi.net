@@ -3,7 +3,7 @@ using System.Text;
 using System.Text.Json.Nodes;
 
 // 测试用假守护进程：模拟 pi-env 的启动形状（`serve --token <hex>`）与几种传输边界。
-// 用法：Pi.Env.FakeDaemon serve --token <hex> --script <noise|corrupt|garbage-json|hello>
+// 用法：Pi.Env.FakeDaemon serve --token <hex> --script <noise|corrupt|garbage-json|hello|echo>
 var arguments = Environment.GetCommandLineArgs().Skip(1).ToArray();
 if (!arguments.Contains("serve", StringComparer.Ordinal))
 {
@@ -40,8 +40,12 @@ switch (script)
     case "garbage-json":
         Write(Frame(2, 1, Encoding.UTF8.GetBytes("not json")));
         break;
+    case "echo":
+        // 完整的请求/应答循环：按 id 应答 hello（报告真实 pid），`echo` 原样返回 n，
+        // `spew` 先往 stderr 灌 1 MiB 再应答（制造没人读 stderr 时的管道阻塞）。
+        return Serve();
     default:
-        Write(Frame(2, 1, Encoding.UTF8.GetBytes(Hello())));
+        Write(Frame(2, 1, Encoding.UTF8.GetBytes(Hello(4242))));
         break;
 }
 
@@ -56,6 +60,71 @@ catch (IOException)
 
 return 0;
 
+int Serve()
+{
+    var stdin = Console.OpenStandardInput();
+    var stderr = Console.OpenStandardError();
+    var header = new byte[4];
+    while (true)
+    {
+        if (!ReadExactly(stdin, header)) return 0;
+        var length = BinaryPrimitives.ReadUInt32BigEndian(header);
+        var body = new byte[length];
+        if (!ReadExactly(stdin, body)) return 0;
+        var type = body[0];
+        var id = BinaryPrimitives.ReadUInt32BigEndian(body.AsSpan(1));
+        var jsonLength = BinaryPrimitives.ReadUInt32BigEndian(body.AsSpan(5));
+        if (type != 1) continue; // ping / cancel：忽略。
+        JsonObject request;
+        try
+        {
+            request = JsonNode.Parse(body.AsSpan(9, (int)jsonLength)) as JsonObject
+                ?? throw new InvalidOperationException("not an object");
+        }
+        catch (Exception error)
+        {
+            // 交错或损坏的帧：报告给测试（stderr）并以错误帧应答。
+            Console.Error.WriteLine($"BAD FRAME id={id}: {error.Message}");
+            Write(Frame(3, id, Encoding.UTF8.GetBytes(
+                new JsonObject { ["code"] = "bad_frame", ["message"] = error.Message }.ToJsonString())));
+            continue;
+        }
+
+        var op = request["op"]?.GetValue<string>();
+        string reply;
+        switch (op)
+        {
+            case "hello":
+                reply = Hello(Environment.ProcessId);
+                break;
+            case "spew":
+                var junk = Encoding.UTF8.GetBytes(new string('x', 1023) + "\n");
+                for (var i = 0; i < 1024; i++) stderr.Write(junk, 0, junk.Length);
+                stderr.Flush();
+                reply = new JsonObject { ["spewed"] = true }.ToJsonString();
+                break;
+            default:
+                reply = new JsonObject { ["echo"] = request["n"]?.DeepClone() }.ToJsonString();
+                break;
+        }
+
+        Write(Frame(2, id, Encoding.UTF8.GetBytes(reply)));
+    }
+}
+
+static bool ReadExactly(Stream stream, byte[] buffer)
+{
+    var offset = 0;
+    while (offset < buffer.Length)
+    {
+        var read = stream.Read(buffer, offset, buffer.Length - offset);
+        if (read == 0) return false;
+        offset += read;
+    }
+
+    return true;
+}
+
 static byte[] Frame(byte type, uint id, byte[] json, byte[]? payload = null)
 {
     payload ??= [];
@@ -69,7 +138,7 @@ static byte[] Frame(byte type, uint id, byte[] json, byte[]? payload = null)
     return frame;
 }
 
-static string Hello() => new JsonObject
+static string Hello(long pid) => new JsonObject
 {
     ["protocol"] = 1,
     ["version"] = "fake",
@@ -80,5 +149,5 @@ static string Hello() => new JsonObject
     ["separator"] = "/",
     ["cwd"] = "/",
     ["driveCwds"] = new JsonObject(),
-    ["pid"] = 4242,
+    ["pid"] = pid,
 }.ToJsonString();

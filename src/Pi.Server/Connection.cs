@@ -46,6 +46,13 @@ public sealed class ConnectionState
 
     public required ProtocolCodec.ClientMessageDecoder Decoder { get; init; }
 
+    /// <summary>
+    /// 守护 <see cref="ActiveRequests"/> 与 <see cref="ServiceStateEncoders"/>：读泵线程加入、请求续体移除、
+    /// 发布者查找、断开时清空都在不同线程上。TS 在事件循环里不需要它。闸内不发送、不调用服务代码。
+    /// </summary>
+    public Lock Gate { get; } = new();
+
+    /// <summary>每个订阅的状态编码器；由 <see cref="Gate"/> 守护。</summary>
     public required Dictionary<string, ServiceStateEncoder> ServiceStateEncoders { get; init; }
 
     public ConnectionStage Stage { get; set; } = ConnectionStage.AwaitingHello;
@@ -59,6 +66,7 @@ public sealed class ConnectionState
 
     public IRoutedServerServiceAttachment? ServerServices { get; set; }
 
+    /// <summary>在途请求（取消控制器 + 目标）；由 <see cref="Gate"/> 守护。</summary>
     public Dictionary<string, ActiveRequest> ActiveRequests { get; init; } = [];
 
     /// <summary>连接是否已进入终态。对应 TS <c>isTerminalConnection</c>。</summary>

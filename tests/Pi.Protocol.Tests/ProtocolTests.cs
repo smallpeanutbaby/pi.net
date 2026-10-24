@@ -68,6 +68,47 @@ public class CborTests
         Assert.Equal(new List<object?> { 2L, 3L }, roundTripped["b"]);
     }
 
+    [Theory]
+    [InlineData(0xBA)] // map(1_000_000) headers, each followed by the key "a"
+    [InlineData(0x9A)] // array(1_000_000) headers
+    public void HostileNestedContainerHeadersFailFastWithoutPreallocating(byte header)
+    {
+        // 64 nested containers each declaring 1_000_000 entries (within MaxContainerLength and MaxDepth),
+        // innermost truncated: a few hundred bytes that used to pre-allocate ~2 GB before the first
+        // element was read. Capacity must follow the bytes actually left, not the declared length.
+        var payload = new List<byte>();
+        for (var level = 0; level < 64; level++)
+        {
+            payload.AddRange([header, 0x00, 0x0F, 0x42, 0x40]);
+            if (header == 0xBA) payload.AddRange([0x61, (byte)'a']);
+        }
+        payload.AddRange([header, 0x00, 0x0F, 0x42, 0x40]);
+        var bytes = payload.ToArray();
+
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        Assert.Throws<CborError>(() => CborCodec.Decode(bytes));
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.True(allocated < 4 * 1024 * 1024, $"decoding {bytes.Length} hostile bytes allocated {allocated} bytes");
+
+        // The same frame through the server's pre-handshake message decoder.
+        var decoder = new ProtocolCodec.ClientMessageDecoder();
+        var frame = Frame.EncodeFrame(bytes);
+        before = GC.GetAllocatedBytesForCurrentThread();
+        Assert.ThrowsAny<Exception>(() => decoder.Push(frame));
+        allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.True(allocated < 4 * 1024 * 1024, $"ClientMessageDecoder.Push allocated {allocated} bytes");
+    }
+
+    [Fact]
+    public void LargeDeclaredContainersStillDecodeWhenTheBytesAreThere()
+    {
+        var list = new List<object?>(Enumerable.Range(0, 70_000).Select(i => (object?)(long)i));
+        var map = new Dictionary<string, object?>();
+        for (var i = 0; i < 1_000; i++) map[$"k{i}"] = (long)i;
+        Assert.Equal(list, CborCodec.Decode(CborCodec.Encode(list)));
+        Assert.Equal(map, CborCodec.Decode(CborCodec.Encode(map)));
+    }
+
     [Fact]
     public void SkipsUndefinedMapEntriesLikeTypeScript()
     {

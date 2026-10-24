@@ -122,23 +122,47 @@ public sealed class OAuthCallbackServer : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         TaskCompletionSource<OAuthCallback> completion;
+        CancellationTokenSource timeout;
         lock (_lock)
         {
             if (_pending.ContainsKey(state))
                 throw new InvalidOperationException("OAuth state is already pending");
             completion = new TaskCompletionSource<OAuthCallback>(TaskCreationOptions.RunContinuationsAsynchronously);
-            var timeout = new CancellationTokenSource(TimeoutMs);
-            timeout.Token.Register(() =>
-            {
-                lock (_lock) _pending.Remove(state);
-                completion.TrySetException(new TimeoutException("OAuth callback timed out"));
-            });
+            timeout = new CancellationTokenSource(TimeoutMs);
             _pending[state] = completion;
             _pendingMeta[state] = (path, timeout);
         }
+        // 超时与调用方取消都要把 state 连同元数据一起摘掉：否则同一 state 无法再次等待，
+        // 定时器也随之泄漏，直到服务器整体释放。
+        timeout.Token.Register(() =>
+        {
+            if (Forget(state, completion))
+                completion.TrySetException(new TimeoutException("OAuth callback timed out"));
+        });
         if (cancellationToken.CanBeCanceled)
-            cancellationToken.Register(() => completion.TrySetCanceled(cancellationToken));
+        {
+            var registration = cancellationToken.Register(() =>
+            {
+                if (Forget(state, completion)) completion.TrySetCanceled(cancellationToken);
+            });
+            _ = completion.Task.ContinueWith(_ => registration.Dispose(), CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        }
         return completion.Task;
+    }
+
+    /// <summary>摘掉一个仍由 <paramref name="completion"/> 持有的 state 及其超时；已被回调或别人摘掉则返回 false。</summary>
+    private bool Forget(string state, TaskCompletionSource<OAuthCallback> completion)
+    {
+        CancellationTokenSource? timeout = null;
+        lock (_lock)
+        {
+            if (!_pending.TryGetValue(state, out var current) || !ReferenceEquals(current, completion)) return false;
+            _pending.Remove(state);
+            if (_pendingMeta.Remove(state, out var meta)) timeout = meta.Timeout;
+        }
+        timeout?.Dispose();
+        return true;
     }
 
     public async ValueTask DisposeAsync()
@@ -204,10 +228,11 @@ public sealed class OAuthCallbackServer : IAsyncDisposable
         (string? Path, CancellationTokenSource Timeout) meta = (null, null!);
         lock (_lock)
         {
-            if (state is not null && _pending.TryGetValue(state, out var found))
+            // 查找与摘除在同一把锁里：与超时/取消的 Forget 互斥，state 只会被一方认领。
+            if (state is not null && _pending.Remove(state, out var found))
             {
                 pending = found;
-                _pendingMeta.TryGetValue(state, out meta);
+                _pendingMeta.Remove(state, out meta);
             }
         }
         if (state is null || pending is null)
@@ -215,12 +240,7 @@ public sealed class OAuthCallbackServer : IAsyncDisposable
             Reply(context.Response, 400, OAuthCallbackPage.Failure("Invalid or expired OAuth state"));
             return;
         }
-        lock (_lock)
-        {
-            _pending.Remove(state);
-            _pendingMeta.Remove(state);
-        }
-        meta.Timeout.Dispose();
+        meta.Timeout?.Dispose();
 
         if (meta.Path is not null && url.AbsolutePath != meta.Path)
         {

@@ -71,14 +71,14 @@ public static partial class CborCodec
                 case 4:
                 {
                     var length = ReadLength(additionalInformation, "array", options.MaxContainerLength);
-                    var result = new List<object?>((int)Math.Min(length, int.MaxValue));
+                    var result = new List<object?>(InitialCapacity(length, minimumBytesPerEntry: 1));
                     for (long index = 0; index < length; index++) result.Add(ReadItem(depth + 1));
                     return result;
                 }
                 case 5:
                 {
                     var length = ReadLength(additionalInformation, "map", options.MaxContainerLength);
-                    var result = new Dictionary<string, object?>((int)Math.Min(length, int.MaxValue));
+                    var result = new Dictionary<string, object?>(InitialCapacity(length, minimumBytesPerEntry: 2));
                     for (long index = 0; index < length; index++)
                     {
                         var key = ReadItem(depth + 1);
@@ -117,6 +117,19 @@ public static partial class CborCodec
             if (value == Math.Truncate(value) && Math.Abs(value) > MaxSafeInteger)
                 throw new CborError("Decoded CBOR integer is outside the safe range");
             return value;
+        }
+
+        /// <summary>
+        /// Initial container capacity for a declared, untrusted length: every element (or
+        /// key/value pair) needs at least <paramref name="minimumBytesPerEntry"/> more input bytes, so
+        /// anything beyond the remaining payload can only end in a truncation error. Without the cap,
+        /// 64 nested <c>map(1_000_000)</c> headers (a few hundred bytes) pre-allocate gigabytes before the
+        /// first element is read; the collections still grow on demand, so decoding is unchanged.
+        /// </summary>
+        private int InitialCapacity(long declaredLength, int minimumBytesPerEntry)
+        {
+            var remaining = (long)(bytes.Length - Offset) / minimumBytesPerEntry;
+            return (int)Math.Min(declaredLength, remaining);
         }
 
         private long ReadLength(uint additionalInformation, string kind, long limit)

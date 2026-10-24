@@ -51,7 +51,7 @@ public static class SseStream
 
         void ProcessLine(string rawLine)
         {
-            var line = rawLine.EndsWith("\r") ? rawLine[..^1] : rawLine;
+            var line = rawLine.EndsWith('\r') ? rawLine[..^1] : rawLine;
             if (line.Length == 0) { Dispatch(); return; }
             if (line.StartsWith(':')) return; // 注释行
             var colon = line.IndexOf(':');
@@ -73,11 +73,14 @@ public static class SseStream
 
         var buffered = new StringBuilder();
         var buffer = new byte[8192];
-        while (true)
+        var chars = new char[Encoding.UTF8.GetMaxCharCount(buffer.Length)];
+        // 一次 ReadAsync 可能把多字节 UTF-8 序列截成两半：解码器跨块保留未完成的字节，
+        // 而不是每块独立 GetString 得到 U+FFFD。
+        var decoder = Encoding.UTF8.GetDecoder();
+
+        void ProcessDecoded(int count)
         {
-            var read = await stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
-            if (read == 0) break;
-            buffered.Append(Encoding.UTF8.GetString(buffer, 0, read));
+            buffered.Append(chars, 0, count);
             var text = buffered.ToString();
             buffered.Clear();
             var newline = text.IndexOf('\n');
@@ -92,6 +95,15 @@ public static class SseStream
             if (Encoding.UTF8.GetByteCount(buffered.ToString()) > maxEventBytes)
                 throw new InvalidOperationException($"MCP SSE event exceeds {maxEventBytes} bytes");
         }
+
+        while (true)
+        {
+            var read = await stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+            if (read == 0) break;
+            ProcessDecoded(decoder.GetChars(buffer, 0, read, chars, 0, flush: false));
+        }
+        // 流尾残留的不完整序列按替换字符落盘，与一次性 GetString 的行为一致。
+        ProcessDecoded(decoder.GetChars(buffer, 0, 0, chars, 0, flush: true));
         if (buffered.Length > 0) ProcessLine(buffered.ToString());
         Dispatch();
     }
@@ -179,7 +191,7 @@ public sealed partial class StreamableHttpTransport : TransportEvents
     {
         if (!_started || _closed) throw new McpConnectionClosedError();
 
-        using var response = await SendAuthorizedAsync(
+        var response = await SendAuthorizedAsync(
             HttpMethod.Post,
             request =>
             {
@@ -189,30 +201,53 @@ public sealed partial class StreamableHttpTransport : TransportEvents
             JsonRpc.Serialize(message).ToJsonString(),
             includeSession: true,
             cancellationToken).ConfigureAwait(false);
-        await CheckResponseAsync(response).ConfigureAwait(false);
-        CaptureSession(response);
+        var handedOff = false;
+        try
+        {
+            await CheckResponseAsync(response).ConfigureAwait(false);
+            CaptureSession(response);
 
-        if (message is not JsonRpcMessage.Request)
-        {
-            // 通知/响应以 202 确认，无应答体；notifications/initialized 之后才允许开 GET 流。
-            if (message is JsonRpcMessage.Notification { Method: "notifications/initialized" })
-                StartGetStream();
-            return;
-        }
+            if (message is not JsonRpcMessage.Request)
+            {
+                // 通知/响应以 202 确认，无应答体；notifications/initialized 之后才允许开 GET 流。
+                if (message is JsonRpcMessage.Notification { Method: "notifications/initialized" })
+                    StartGetStream();
+                return;
+            }
 
-        var contentType = response.Content.Headers.ContentType?.MediaType?.ToLowerInvariant();
-        if (contentType == "application/json")
-        {
-            var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-            var node = JsonNode.Parse(body);
-            foreach (var item in node is JsonArray array ? array : [node])
-                EmitMessage(JsonRpc.Parse(item));
-            return;
+            var contentType = response.Content.Headers.ContentType?.MediaType?.ToLowerInvariant();
+            if (contentType == "application/json")
+            {
+                var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+                var node = JsonNode.Parse(body);
+                foreach (var item in node is JsonArray array ? array : [node])
+                    EmitMessage(JsonRpc.Parse(item));
+                return;
+            }
+            if (contentType == "text/event-stream")
+            {
+                // 请求的应答走 SSE：规范只说服务器"应当"在应答后关闭流。流在后台消费、消息照常分发，
+                // 挂起请求由客户端在应答到达时落定而不是等流 EOF——否则保持流打开的合规服务器
+                // 会让 send 永不返回，请求超时也覆盖不到它（对齐 MCP TS SDK 不等待 SSE 流的做法）。
+                var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+                handedOff = true;
+                _ = ConsumeResponseStreamAsync(response, stream);
+                return;
+            }
+            throw new McpHttpError((long)response.StatusCode, $"Unsupported MCP response content type: {contentType ?? "missing"}");
         }
-        if (contentType == "text/event-stream")
+        finally
         {
-            // 请求的应答走 SSE：解析流并把其中的消息分发出去。
-            var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            if (!handedOff) response.Dispose();
+        }
+    }
+
+    /// <summary>后台消费一次 POST 的 SSE 应答流；流在传输关闭时随 <see cref="_closedCts"/> 一起结束。</summary>
+    private async Task ConsumeResponseStreamAsync(HttpResponseMessage response, Stream stream)
+    {
+        using var owned = response;
+        try
+        {
             await SseStream.ConsumeAsync(stream, new ConsumeSseOptions
             {
                 MaxEventBytes = _options.MaxMessageBytes,
@@ -221,10 +256,16 @@ public sealed partial class StreamableHttpTransport : TransportEvents
                     if (@event.Data.Length == 0) return;
                     EmitMessage(JsonRpc.ParseText(@event.Data));
                 },
-            }, cancellationToken).ConfigureAwait(false);
-            return;
+            }, _closedCts.Token).ConfigureAwait(false);
         }
-        throw new McpHttpError((long)response.StatusCode, $"Unsupported MCP response content type: {contentType ?? "missing"}");
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception error)
+        {
+            // 关闭过程中释放 HttpClient 引发的读失败不是错误。
+            if (!_closed) EmitError(error);
+        }
     }
 
     /// <inheritdoc />

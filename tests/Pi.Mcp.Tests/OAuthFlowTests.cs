@@ -171,6 +171,28 @@ public class OAuthFlowTests
     }
 
     [Fact]
+    public async Task CallbackServerForgetsAStateWhoseWaitWasCancelled()
+    {
+        await using var server = await OAuthCallbackServer.ListenAsync(new OAuthCallbackServerOptions
+        {
+            Port = 0,
+            TimeoutMs = 60_000,
+        });
+
+        using var cancellation = new CancellationTokenSource();
+        var pending = server.WaitForCallbackAsync("state-2", cancellationToken: cancellation.Token);
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending);
+
+        // 取消后 state 不再挂起：同一个 state 可以重新等待，迟到的回调也不会命中旧条目。
+        var again = server.WaitForCallbackAsync("state-2");
+        using var client = new HttpClient();
+        var response = await client.GetAsync(server.RedirectUrl + "?code=late&state=state-2");
+        Assert.True(response.IsSuccessStatusCode);
+        Assert.Equal("late", (await again).Code);
+    }
+
+    [Fact]
     public async Task IssWithoutDiscoveredMetadataIsRejectedBeforeTheExchange()
     {
         // 上游 c5f5b3282：没有授权服务器元数据就没有 issuer 可比，此时任何 iss 都必须拒绝，

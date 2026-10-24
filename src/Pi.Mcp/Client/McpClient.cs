@@ -345,7 +345,9 @@ public sealed class McpClient
 
         try
         {
-            await transport.SendAsync(new JsonRpcMessage.Request(id, method, requestParams), cancellationToken)
+            // 超时与中止同样覆盖发送阶段：HTTP 传输的 send 要等到应答头到达才返回，
+            // 否则一个挂死的服务器会让请求永远不超时。
+            await transport.SendAsync(new JsonRpcMessage.Request(id, method, requestParams), waitSource.Token)
                 .ConfigureAwait(false);
 
             var cancelled = Task.Delay(Timeout.Infinite, waitSource.Token);
@@ -364,12 +366,21 @@ public sealed class McpClient
             NotifyCancelled(id, cancellable, "Request timed out");
             throw new McpTimeoutError(timeoutMs);
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        catch (Exception error) when ((error is OperationCanceledException or McpAbortError)
+                                      && cancellationToken.IsCancellationRequested)
         {
             // 传输层在等待阶段之前就观察到了调用方取消。
             RemovePending(id, pending);
             NotifyCancelled(id, cancellable, "Aborted");
             throw new McpAbortError();
+        }
+        catch (Exception error) when ((error is OperationCanceledException or McpAbortError)
+                                      && timeoutSource is { IsCancellationRequested: true })
+        {
+            // 传输层在发送阶段观察到了超时取消。
+            RemovePending(id, pending);
+            NotifyCancelled(id, cancellable, "Request timed out");
+            throw new McpTimeoutError(timeoutMs);
         }
         finally
         {

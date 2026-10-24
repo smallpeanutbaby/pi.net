@@ -51,6 +51,12 @@ public sealed class StdioTransport : TransportEvents, IMcpTransport
     private const int StdinCloseGraceMs = 500;
 
     private readonly StdioTransportOptions _options;
+    /// <summary>
+    /// stdin 写闸。并行请求、fire-and-forget 的 <c>notifications/cancelled</c> 与服务器请求的应答
+    /// 会从多个线程同时 <see cref="SendAsync"/>：<see cref="StreamWriter"/> 不允许并发使用，
+    /// 而交错的半行会毁掉按行分帧，所以每一行都在闸内一次写完。
+    /// </summary>
+    private readonly SemaphoreSlim _writeGate = new(1, 1);
     private Process? _process;
     private CancellationTokenSource? _readCts;
     private string? _protocolVersion;
@@ -128,13 +134,24 @@ public sealed class StdioTransport : TransportEvents, IMcpTransport
         _process = process;
         _readCts = new CancellationTokenSource();
 
-        _ = PumpStdoutAsync(process, _readCts.Token);
+        var stdoutPump = PumpStdoutAsync(process, _readCts.Token);
         if (!inheritStderr) _ = PumpStderrAsync(process, _readCts.Token);
 
-        process.Exited += (_, _) => EmitClose();
+        process.Exited += (_, _) => _ = EmitCloseAfterStdoutDrainedAsync(stdoutPump);
         process.EnableRaisingEvents = true;
-        if (process.HasExited) EmitClose();
+        if (process.HasExited) _ = EmitCloseAfterStdoutDrainedAsync(stdoutPump);
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 进程退出事件可能先于 stdout 管道读尽触发：先让读泵把最后一条应答派发出去，再宣布关闭，
+    /// 否则挂起请求会被拒绝，随后到达的应答成了"未知请求"。读泵自己在 EOF 后也会发 close；
+    /// 这里只是兜底——孙进程仍持有管道写端时读泵不会结束，故至多等关闭超时那么久。
+    /// </summary>
+    private async Task EmitCloseAfterStdoutDrainedAsync(Task stdoutPump)
+    {
+        await Task.WhenAny(stdoutPump, Task.Delay(Math.Max(0, _options.CloseTimeoutMs))).ConfigureAwait(false);
+        EmitClose();
     }
 
     /// <inheritdoc />
@@ -146,8 +163,20 @@ public sealed class StdioTransport : TransportEvents, IMcpTransport
         if (process.HasExited) throw new McpConnectionClosedError("MCP server process has exited");
 
         var line = JsonRpc.Serialize(message).ToJsonString() + "\n";
-        await process.StandardInput.WriteAsync(line.AsMemory(), cancellationToken).ConfigureAwait(false);
-        await process.StandardInput.FlushAsync(cancellationToken).ConfigureAwait(false);
+        // 取消只作用于排队等闸：一行一旦开始写就整行写完——半行比迟到的一行更糟，
+        // 它会让之后的每一条消息都变成无法解析的垃圾。
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_closed) throw new McpConnectionClosedError("MCP stdio transport is closed");
+            await process.StandardInput.WriteAsync(line.AsMemory(), CancellationToken.None).ConfigureAwait(false);
+            await process.StandardInput.FlushAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
     }
 
     /// <inheritdoc />

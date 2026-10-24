@@ -121,6 +121,13 @@ public sealed class Connection : IDisposable
     private const int StartTimeoutMs = 60_000;
 
     private readonly ConnectionOptions _options;
+
+    /// <summary>
+    /// 守护 <see cref="_session"/>、<see cref="_ready"/>、<see cref="_closed"/>、请求 id 与每个会话的
+    /// 挂起表：请求来自任意线程，应答来自读泵线程，ping 与超时来自定时器线程。TS 在单线程里不需要它。
+    /// 闸内不写 stdin、不调用用户回调、不落定 TaskCompletionSource。
+    /// </summary>
+    private readonly Lock _gate = new();
     private Session? _session;
     private Task<Ready>? _ready;
     private long _sessions;
@@ -152,7 +159,8 @@ public sealed class Connection : IDisposable
         options ??= new RequestOptions();
         if (options.Session is { } sessionId)
         {
-            var current = _session;
+            Session? current;
+            lock (_gate) current = _session;
             if (current is null || current.Id != sessionId || !current.Live) throw Lost("pi-env connection lost");
             return await SendAsync(current, op, json ?? new JsonObject(), options).ConfigureAwait(false);
         }
@@ -164,14 +172,21 @@ public sealed class Connection : IDisposable
     /// <summary>停止守护进程；它会杀死自己启动的一切。</summary>
     public void Close()
     {
-        _closed = true;
-        if (_session is { } session) Teardown(session, Closed());
+        Session? session;
+        lock (_gate)
+        {
+            _closed = true;
+            session = _session;
+        }
+
+        if (session is not null) Teardown(session, Closed());
     }
 
     /// <summary>杀死一个 <c>exec</c> 而不中止它。</summary>
     public void Kill(long id, long session)
     {
-        var current = _session;
+        Session? current;
+        lock (_gate) current = _session;
         if (current is not null && current.Id == session && current.Live)
         {
             Write(current, Frame(Cancel, id, new JsonObject { ["mode"] = "kill" }));
@@ -182,37 +197,43 @@ public sealed class Connection : IDisposable
 
     private Task<Ready> ConnectAsync()
     {
-        if (_closed) return Task.FromException<Ready>(Closed());
-        if (_ready is null)
+        lock (_gate)
         {
-            var ready = StartAsync();
+            if (_closed) return Task.FromException<Ready>(Closed());
+            if (_ready is { } existing) return existing;
+
+            // 并发的首个请求只启动一个守护进程：启动任务在闸内登记，主体（求值命令、拉起进程）
+            // 在闸外的线程池上运行。
+            var ready = Task.Run(StartAsync);
             _ready = ready;
             // 失败的启动不被记住：下一次请求重试。
             _ = ready.ContinueWith(
                 task =>
                 {
-                    if (task.IsFaulted)
+                    _ = task.Exception;
+                    lock (_gate)
                     {
-                        _ = task.Exception;
                         if (ReferenceEquals(_ready, ready)) _ready = null;
                     }
                 },
                 CancellationToken.None,
-                TaskContinuationOptions.ExecuteSynchronously,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
                 TaskScheduler.Default);
-            // 续体可能已把 _ready 清空（同步失败时立即执行），本次调用仍返回这一轮的任务。
             return ready;
         }
-
-        return _ready;
     }
 
     private async Task<Reply> SendAsync(Session session, string op, JsonObject json, RequestOptions options)
     {
-        if (!session.Live) throw Lost("pi-env connection lost");
-        var id = _nextId++;
+        long id;
         var completion = new TaskCompletionSource<Reply>(TaskCreationOptions.RunContinuationsAsynchronously);
-        session.Pending[id] = new Pending { Completion = completion, OnEvent = options.OnEvent };
+        lock (_gate)
+        {
+            if (!session.Live) throw Lost("pi-env connection lost");
+            id = _nextId++;
+            session.Pending[id] = new Pending { Completion = completion, OnEvent = options.OnEvent };
+        }
+
         options.OnStart?.Invoke(id, session.Id);
         var body = EnvJson.Normalize(json);
         // 与 TS 的 `{ ...json, op }` 一致：op 最后写入，覆盖调用方同名字段。
@@ -237,21 +258,26 @@ public sealed class Connection : IDisposable
         }
     }
 
-    private void Write(Session session, byte[] data)
+    private static void Write(Session session, byte[] data)
     {
         if (!session.Live) return;
-        try
+        // 请求线程、取消回调与 ping 定时器都会写 stdin：帧必须整个落盘，不能交错。
+        // 这里不用 _gate——守护进程若因 stdout 积压而停止读 stdin，阻塞的写会连带卡住读泵。
+        lock (session.WriteGate)
         {
-            var stdin = session.Process.StandardInput.BaseStream;
-            stdin.Write(data, 0, data.Length);
-            stdin.Flush();
-        }
-        catch (IOException)
-        {
-            // 与 TS 的 `child.stdin.on("error", () => {})` 一致：写失败由退出事件统一处理。
-        }
-        catch (ObjectDisposedException)
-        {
+            try
+            {
+                var stdin = session.Process.StandardInput.BaseStream;
+                stdin.Write(data, 0, data.Length);
+                stdin.Flush();
+            }
+            catch (IOException)
+            {
+                // 与 TS 的 `child.stdin.on("error", () => {})` 一致：写失败由退出事件统一处理。
+            }
+            catch (ObjectDisposedException)
+            {
+            }
         }
     }
 
@@ -272,7 +298,11 @@ public sealed class Connection : IDisposable
             });
         }
 
-        if (_closed) throw Closed();
+        lock (_gate)
+        {
+            if (_closed) throw Closed();
+        }
+
         if (command.Count == 0)
         {
             throw new RemoteError(new JsonObject { ["code"] = "spawn_error", ["message"] = "No daemon command" });
@@ -308,8 +338,21 @@ public sealed class Connection : IDisposable
             });
         }
 
-        var session = new Session(++_sessions, process, token);
-        _session = session;
+        var session = new Session(Interlocked.Increment(ref _sessions), process, token);
+        bool closed;
+        lock (_gate)
+        {
+            closed = _closed;
+            if (!closed) _session = session;
+        }
+
+        if (closed)
+        {
+            // Close() 抢在进程拉起之后：不留下无人管理的守护进程。
+            Teardown(session, Closed());
+            throw Closed();
+        }
+
         var failure = new TaskCompletionSource<Exception>(TaskCreationOptions.RunContinuationsAsynchronously);
         using var startTimer = new Timer(
             _ => failure.TrySetResult(Lost($"pi-env did not answer within {StartTimeoutMs / 1000} s")),
@@ -325,11 +368,11 @@ public sealed class Connection : IDisposable
         };
         _ = Task.Run(() => PumpStdoutAsync(session));
         _ = Task.Run(() => PumpStderrAsync(session));
-        session.Timer = new Timer(
+        var timer = new Timer(
             _ =>
             {
                 Write(session, Frame(Ping, 0, new JsonObject()));
-                if (Environment.TickCount64 - session.LastSeen > SilenceLimitMs)
+                if (Environment.TickCount64 - Volatile.Read(ref session.LastSeen) > SilenceLimitMs)
                 {
                     Teardown(session, Lost("pi-env connection timed out"));
                 }
@@ -337,6 +380,12 @@ public sealed class Connection : IDisposable
             null,
             PingIntervalMs,
             PingIntervalMs);
+        lock (_gate)
+        {
+            // 进程可能已经退出并被拆掉：定时器只挂到仍存活的会话上，否则它会一直 ping 一个死会话。
+            if (session.Live) session.Timer = timer;
+            else timer.Dispose();
+        }
 
         try
         {
@@ -372,14 +421,21 @@ public sealed class Connection : IDisposable
 
     private void Teardown(Session session, Exception error)
     {
-        if (!session.Live) return;
-        session.Live = false;
-        session.Timer?.Dispose();
-        session.Timer = null;
-        if (ReferenceEquals(_session, session))
+        Pending[] pending;
+        lock (_gate)
         {
-            _session = null;
-            _ready = null;
+            if (!session.Live) return;
+            session.Live = false;
+            session.Timer?.Dispose();
+            session.Timer = null;
+            if (ReferenceEquals(_session, session))
+            {
+                _session = null;
+                _ready = null;
+            }
+
+            pending = session.Pending.Values.ToArray();
+            session.Pending.Clear();
         }
 
         try
@@ -400,8 +456,6 @@ public sealed class Connection : IDisposable
             // 进程可能已退出。
         }
 
-        var pending = session.Pending.Values.ToArray();
-        session.Pending.Clear();
         foreach (var request in pending) request.Completion.TrySetException(error);
     }
 
@@ -426,7 +480,9 @@ public sealed class Connection : IDisposable
 
     private async Task PumpStderrAsync(Session session)
     {
-        if (_options.OnLog is null) return;
+        // stderr 已重定向就必须一直读：没人读的管道填满后，守护进程会在写诊断时阻塞，
+        // 协议随之静默，30 秒后被当作连接超时拆掉。没有 OnLog 时读到即丢。
+        var onLog = _options.OnLog;
         var stream = session.Process.StandardError.BaseStream;
         var buffer = new byte[64 * 1024];
         try
@@ -435,7 +491,7 @@ public sealed class Connection : IDisposable
             {
                 var read = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length)).ConfigureAwait(false);
                 if (read == 0) return;
-                _options.OnLog(Encoding.UTF8.GetString(buffer, 0, read));
+                onLog?.Invoke(Encoding.UTF8.GetString(buffer, 0, read));
             }
         }
         catch (Exception)
@@ -447,7 +503,7 @@ public sealed class Connection : IDisposable
     private void OnData(Session session, ReadOnlySpan<byte> chunk)
     {
         if (!session.Live) return;
-        session.LastSeen = Environment.TickCount64;
+        Volatile.Write(ref session.LastSeen, Environment.TickCount64);
         session.Buffer.Append(chunk);
         if (!session.Synced)
         {
@@ -503,16 +559,21 @@ public sealed class Connection : IDisposable
 
     private void Dispatch(Session session, byte type, long id, JsonObject json, byte[] payload)
     {
-        session.Pending.TryGetValue(id, out var pending);
+        if (type != Event && type != Result && type != Error) return;
+        Pending? pending;
+        lock (_gate)
+        {
+            session.Pending.TryGetValue(id, out pending);
+            if (pending is not null && type != Event) session.Pending.Remove(id);
+        }
+
+        if (pending is null) return;
         if (type == Event)
         {
-            pending?.OnEvent?.Invoke(json, payload);
+            pending.OnEvent?.Invoke(json, payload);
             return;
         }
 
-        if (type != Result && type != Error) return;
-        if (pending is null) return;
-        session.Pending.Remove(id);
         if (type == Result)
         {
             pending.Completion.TrySetResult(new Reply { Json = json, Payload = payload, Session = session.Id });
@@ -593,18 +654,24 @@ public sealed class Connection : IDisposable
 
         public string Token { get; }
 
+        /// <summary>按 id 挂起的请求；由 <c>Connection._gate</c> 守护。</summary>
         public Dictionary<long, Pending> Pending { get; } = new();
 
-        /// <summary>已收到但尚未解析的字节。</summary>
+        /// <summary>stdin 写闸：一帧一次写完。</summary>
+        public Lock WriteGate { get; } = new();
+
+        /// <summary>已收到但尚未解析的字节（只在读泵线程上使用）。</summary>
         public ByteQueue Buffer { get; } = new();
 
         public bool Synced { get; set; }
 
-        public long LastSeen { get; set; } = Environment.TickCount64;
+        /// <summary>最近一次收到字节的时刻；读泵写、定时器读。</summary>
+        public long LastSeen = Environment.TickCount64;
 
         public Timer? Timer { get; set; }
 
-        public bool Live { get; set; } = true;
+        /// <summary>由 <c>Connection._gate</c> 守护地置为 false；闸外的读取只是快速路径。</summary>
+        public volatile bool Live = true;
     }
 
     /// <summary>可增长的接收缓冲：追加、查找、消费前缀，必要时合并为连续区间。</summary>

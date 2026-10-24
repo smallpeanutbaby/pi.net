@@ -224,12 +224,21 @@ public sealed class SessionRouter<TMetadata> where TMetadata : ISessionMetadata
 
     private async Task<T> RunForClientAsync<T>(object client, Func<Task<T>> operation)
     {
-        Task previous;
-        lock (_gate) previous = _clientOperations.GetValueOrDefault(client) ?? Task.CompletedTask;
-        var result = RunAfterAsync(previous, operation);
-        var tail = result.ContinueWith(_ => { }, CancellationToken.None,
-            TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-        lock (_gate) _clientOperations[client] = tail;
+        Task<T> result;
+        Task tail;
+        lock (_gate)
+        {
+            // 读旧尾与写新尾必须在同一个临界区：否则两个并发调用会读到同一个前驱，
+            // 同时跑起来（与 Durable 里已修的 Session.Enqueue 是同一种竞态）。
+            // 操作本体用不带 ExecuteSynchronously 的续体启动，不会在闸内跑服务代码；
+            // 前驱的失败被吞掉，不影响后续（对齐 TS 的 previous.catch(() => {})）。
+            var previous = _clientOperations.GetValueOrDefault(client) ?? Task.CompletedTask;
+            result = previous.ContinueWith(_ => operation(), CancellationToken.None,
+                TaskContinuationOptions.None, TaskScheduler.Default).Unwrap();
+            tail = result.ContinueWith(_ => { }, CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            _clientOperations[client] = tail;
+        }
         _ = tail.ContinueWith(_ =>
         {
             lock (_gate)
@@ -241,19 +250,6 @@ public sealed class SessionRouter<TMetadata> where TMetadata : ISessionMetadata
             }
         }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         return await result.ConfigureAwait(false);
-    }
-
-    private static async Task<T> RunAfterAsync<T>(Task previous, Func<Task<T>> operation)
-    {
-        try
-        {
-            await previous.ConfigureAwait(false);
-        }
-        catch
-        {
-            // 对齐 TS 的 previous.catch(() => {})。
-        }
-        return await operation().ConfigureAwait(false);
     }
 
     private async Task AttachClientNowAsync(object client, string sessionId, Context context)

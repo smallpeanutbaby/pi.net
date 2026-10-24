@@ -192,6 +192,114 @@ public class ConnectionTests
         Assert.True(error.Lost);
     }
 
+    [Fact]
+    public async Task ConcurrentFirstRequestsStartOneDaemonThatCloseStops()
+    {
+        var starts = 0;
+        var connection = new Connection(new ConnectionOptions
+        {
+            Command = () =>
+            {
+                Interlocked.Increment(ref starts);
+                return Task.FromResult(TestPaths.FakeCommand("echo"));
+            },
+        });
+
+        // 八个线程同时发出首个请求：惰性启动必须只拉起一个守护进程。
+        var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var requests = Enumerable.Range(0, 8).Select(_ => Task.Run(async () =>
+        {
+            await start.Task;
+            return await connection.InfoAsync();
+        })).ToArray();
+        start.SetResult();
+        var infos = await Task.WhenAll(requests).WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(1, starts);
+        var pid = Assert.Single(infos.Select(info => info.Pid).Distinct());
+        Assert.True(pid > 0);
+
+        // Close 停掉的正是那一个守护进程，不留孤儿。
+        connection.Close();
+        await WaitForExitAsync(pid);
+        var closed = await Assert.ThrowsAsync<RemoteError>(() => connection.InfoAsync());
+        Assert.Equal("Connection closed", closed.Message);
+    }
+
+    [Fact]
+    public async Task ConcurrentRequestsAreFramedAndMatchedCorrectly()
+    {
+        var logs = new StringBuilder();
+        using var connection = new Connection(ConnectionOptions.FromCommand(
+            TestPaths.FakeCommand("echo"),
+            text =>
+            {
+                lock (logs) logs.Append(text);
+            }));
+        await connection.InfoAsync();
+
+        // 并发请求：id 分配、挂起表与 stdin 写都来自不同线程，帧不得交错，应答不得串号。
+        const int count = 500;
+        var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var requests = Enumerable.Range(0, count).Select(n => Task.Run(async () =>
+        {
+            await start.Task;
+            var reply = await connection.RequestAsync("echo", new JsonObject { ["n"] = n });
+            return (Sent: n, Echoed: reply.Json["echo"]?.GetValue<int>());
+        })).ToArray();
+        start.SetResult();
+        var replies = await Task.WhenAll(requests).WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.All(replies, reply => Assert.Equal(reply.Sent, reply.Echoed));
+        lock (logs) Assert.DoesNotContain("BAD FRAME", logs.ToString(), StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task StderrIsDrainedWhetherOrNotAnyoneListens(bool withLog)
+    {
+        var logged = 0L;
+        using var connection = new Connection(new ConnectionOptions
+        {
+            Command = () => Task.FromResult(TestPaths.FakeCommand("echo")),
+            OnLog = withLog ? text => Interlocked.Add(ref logged, text.Length) : null,
+        });
+        await connection.InfoAsync();
+
+        // 守护进程往 stderr 写 1 MiB：没人读的管道会填满并卡住它，请求随之挂死。
+        var reply = await connection.RequestAsync("spew").WaitAsync(TimeSpan.FromSeconds(20));
+        Assert.True(reply.Json["spewed"]!.GetValue<bool>());
+        if (withLog)
+        {
+            // 诊断输出在应答之前全部写出，但读泵可能还没派发完最后一块。
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            while (Interlocked.Read(ref logged) < 1024 * 1024 && DateTime.UtcNow < deadline) await Task.Delay(20);
+            Assert.Equal(1024 * 1024, Interlocked.Read(ref logged));
+        }
+    }
+
+    private static async Task WaitForExitAsync(long pid)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (DateTime.UtcNow < deadline)
+        {
+            try
+            {
+                using var process = System.Diagnostics.Process.GetProcessById((int)pid);
+                if (process.HasExited) return;
+            }
+            catch (ArgumentException)
+            {
+                return;
+            }
+
+            await Task.Delay(50);
+        }
+
+        Assert.Fail($"daemon {pid} is still alive after Close()");
+    }
+
     private static JsonObject ExecRequest(string cwd)
     {
         var argv = new JsonArray();

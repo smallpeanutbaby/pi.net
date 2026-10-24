@@ -317,15 +317,16 @@ public sealed class Server<TMetadata> where TMetadata : ISessionMetadata
             return;
         }
         if (TargetServerId(target) != ServerId) return;
-        if (state.ActiveRequests.TryGetValue(envelope.Id, out var active) && SameTarget(active.Target, target))
-        {
-            active.Controller.Cancel();
-        }
+        ActiveRequest? active;
+        lock (state.Gate) state.ActiveRequests.TryGetValue(envelope.Id, out active);
+        if (active is not null && SameTarget(active.Target, target)) CancelQuietly(active.Controller);
     }
 
     private async Task HandleRequestAsync(ConnectionState state, ClientMessage.Request envelope)
     {
-        if (state.ActiveRequests.ContainsKey(envelope.Id))
+        bool duplicate;
+        lock (state.Gate) duplicate = state.ActiveRequests.ContainsKey(envelope.Id);
+        if (duplicate)
         {
             await SendMessageAsync(state, new ServerMessage.ResponseError(envelope.Id,
                 new ProtocolError("invalid_request", "Request ID is already active"))).ConfigureAwait(false);
@@ -346,7 +347,15 @@ public sealed class Server<TMetadata> where TMetadata : ISessionMetadata
 
         var controller = new CancellationTokenSource();
         var active = new ActiveRequest(controller, envelope.Target);
-        state.ActiveRequests[envelope.Id] = active;
+        lock (state.Gate) duplicate = !state.ActiveRequests.TryAdd(envelope.Id, active);
+        if (duplicate)
+        {
+            // 握手期间排队的消息在续体上派发，可能与读泵线程上的同 id 请求同时到这里。
+            controller.Dispose();
+            await SendMessageAsync(state, new ServerMessage.ResponseError(envelope.Id,
+                new ProtocolError("invalid_request", "Request ID is already active"))).ConfigureAwait(false);
+            return;
+        }
         var context = Context.Todo.WithValue(Context.AbortSignalKey, (CancellationToken?)controller.Token);
         var control = ServiceWire.DecodeServiceControlCall(call);
         var subscribing = control as ServiceControlCall.Subscribe;
@@ -357,10 +366,18 @@ public sealed class Server<TMetadata> where TMetadata : ISessionMetadata
 
         ServiceUpdatePublisher publish = async (subscriptionId, update, _) =>
         {
-            if (subscribing is not null && subscriptionId == subscribing.SubscriptionId && !subscriptionReady)
+            if (subscribing is not null && subscriptionId == subscribing.SubscriptionId)
             {
-                lock (pendingUpdates) pendingUpdates.Add(update);
-                return;
+                // 就绪判定与入队在同一把锁里：否则排空循环看到队列为空、尚未置就绪的那一瞬间
+                // 发布的更新会永远留在队列里（客户端看到序号断档）。
+                lock (pendingUpdates)
+                {
+                    if (!subscriptionReady)
+                    {
+                        pendingUpdates.Add(update);
+                        return;
+                    }
+                }
             }
             await SendServiceUpdateAsync(state, subscriptionId, update).ConfigureAwait(false);
         };
@@ -368,9 +385,15 @@ public sealed class Server<TMetadata> where TMetadata : ISessionMetadata
         try
         {
             if (TargetServerId(envelope.Target) != ServerId) throw new WrongServerError();
-            if (subscribing is not null && state.ServiceStateEncoders.ContainsKey(subscribing.SubscriptionId))
+            bool duplicateSubscription;
+            lock (state.Gate)
             {
-                throw new ProtocolValidationError($"Duplicate service subscription {subscribing.SubscriptionId}");
+                duplicateSubscription = subscribing is not null
+                    && state.ServiceStateEncoders.ContainsKey(subscribing.SubscriptionId);
+            }
+            if (duplicateSubscription)
+            {
+                throw new ProtocolValidationError($"Duplicate service subscription {subscribing!.SubscriptionId}");
             }
 
             object? result;
@@ -399,12 +422,12 @@ public sealed class Server<TMetadata> where TMetadata : ISessionMetadata
                 // The re-encoded wire snapshot travels as a protocol value tree: TS sends the
                 // plain object its encoder produced, and the CBOR layer only carries values.
                 result = ServiceWire.ToValue(stateEncoder.EncodeSnapshot(new ServiceStateDecoder().DecodeSnapshot(wire)));
-                state.ServiceStateEncoders[subscribing.SubscriptionId] = stateEncoder;
+                lock (state.Gate) state.ServiceStateEncoders[subscribing.SubscriptionId] = stateEncoder;
                 installedSubscriptionEncoder = true;
             }
             else if (control is ServiceControlCall.Unsubscribe unsubscribe)
             {
-                state.ServiceStateEncoders.Remove(unsubscribe.SubscriptionId);
+                lock (state.Gate) state.ServiceStateEncoders.Remove(unsubscribe.SubscriptionId);
             }
 
             await SendMessageAsync(state, result is null
@@ -424,18 +447,22 @@ public sealed class Server<TMetadata> where TMetadata : ISessionMetadata
                             pending = pendingUpdates[0];
                             pendingUpdates.RemoveAt(0);
                         }
+                        else
+                        {
+                            // 队列为空与置就绪是同一个临界区：此后的发布直达，之前的都已按序发出。
+                            subscriptionReady = true;
+                        }
                     }
                     if (pending is null) break;
                     await SendServiceUpdateAsync(state, subscribing.SubscriptionId, pending).ConfigureAwait(false);
                 }
-                subscriptionReady = true;
             }
         }
         catch (Exception error)
         {
             if (subscribing is not null && installedSubscriptionEncoder && !responded)
             {
-                state.ServiceStateEncoders.Remove(subscribing.SubscriptionId);
+                lock (state.Gate) state.ServiceStateEncoders.Remove(subscribing.SubscriptionId);
             }
             if (responded)
             {
@@ -454,12 +481,28 @@ public sealed class Server<TMetadata> where TMetadata : ISessionMetadata
         }
         finally
         {
-            if (state.ActiveRequests.TryGetValue(envelope.Id, out var current)
-                && ReferenceEquals(current, active))
+            lock (state.Gate)
             {
-                state.ActiveRequests.Remove(envelope.Id);
+                if (state.ActiveRequests.TryGetValue(envelope.Id, out var current)
+                    && ReferenceEquals(current, active))
+                {
+                    state.ActiveRequests.Remove(envelope.Id);
+                }
             }
             controller.Dispose();
+        }
+    }
+
+    /// <summary>取消一个可能已随请求结束而释放的控制器。</summary>
+    private static void CancelQuietly(CancellationTokenSource controller)
+    {
+        try
+        {
+            controller.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // 请求刚结束：没有什么可取消的了。
         }
     }
 
@@ -485,9 +528,15 @@ public sealed class Server<TMetadata> where TMetadata : ISessionMetadata
         connection.Disconnected = true;
         connection.Stage = ConnectionStage.Closed;
         ClearHandshakeTimeout(connection);
-        foreach (var active in connection.ActiveRequests.Values) active.Controller.Cancel();
-        connection.ActiveRequests.Clear();
-        connection.ServiceStateEncoders.Clear();
+        List<ActiveRequest> active;
+        lock (connection.Gate)
+        {
+            active = connection.ActiveRequests.Values.ToList();
+            connection.ActiveRequests.Clear();
+            connection.ServiceStateEncoders.Clear();
+        }
+        // 取消回调可能同步跑进服务代码：在闸外触发。
+        foreach (var request in active) CancelQuietly(request.Controller);
         bool removed;
         lock (_gate) removed = _connections.Remove(connection);
         if (removed) NotifyConnectionCountChanged();
@@ -508,7 +557,9 @@ public sealed class Server<TMetadata> where TMetadata : ISessionMetadata
     private async Task SendServiceUpdateAsync(ConnectionState connection, string subscriptionId,
         ServiceProviderUpdate update)
     {
-        if (!connection.ServiceStateEncoders.TryGetValue(subscriptionId, out var stateEncoder)) return;
+        ServiceStateEncoder? stateEncoder;
+        lock (connection.Gate) connection.ServiceStateEncoders.TryGetValue(subscriptionId, out stateEncoder);
+        if (stateEncoder is null) return;
         // The wire update travels as a protocol value tree, exactly as the snapshot response does.
         await SendMessageAsync(connection, new ServerMessage.ServiceEvent(subscriptionId,
             ServiceWire.ToValue(stateEncoder.EncodeUpdate(update)))).ConfigureAwait(false);

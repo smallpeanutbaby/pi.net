@@ -124,13 +124,15 @@ public class StreamableHttpTransportTests : IDisposable
             OpenGetStream = false,
         });
         await transport.StartAsync();
-        var messages = new List<JsonRpcMessage>();
-        using var subscription = transport.OnMessage(messages.Add);
+        // SSE 应答在后台消费（服务器可以在应答后保持流打开），所以等消息而不是等 send 返回。
+        var received = new TaskCompletionSource<JsonRpcMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var subscription = transport.OnMessage(message => received.TrySetResult(message));
 
         await transport.SendAsync(new JsonRpcMessage.Request(
             JsonRpcId.FromNumber(2), "tools/list", null));
 
-        var response = Assert.IsType<JsonRpcMessage.SuccessResponse>(Assert.Single(messages));
+        var response = Assert.IsType<JsonRpcMessage.SuccessResponse>(
+            await received.Task.WaitAsync(TimeSpan.FromSeconds(10)));
         var tools = Assert.IsType<JsonArray>(response.Result!["tools"]);
         Assert.Equal("ping_tool", tools[0]!["name"]!.GetValue<string>());
     }

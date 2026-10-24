@@ -90,7 +90,8 @@ public sealed class InstanceDirectory<TEntry> where TEntry : IInstanceDirectoryE
         AssertActive();
         if (_ready) return;
         _ready = true;
-        foreach (var entry in _entries.Values) StartAll(entry);
+        // 观察者处理器可能同步地插入/移除实例或退订：遍历快照，不遍历活表。
+        foreach (var entry in _entries.Values.ToList()) StartAll(entry);
     }
 
     /// <summary>复位：停止观察并移除全部实例（dispose 语义不变）。</summary>
@@ -109,13 +110,13 @@ public sealed class InstanceDirectory<TEntry> where TEntry : IInstanceDirectoryE
         _observers.Add(observer);
         if (_ready)
         {
-            foreach (var entry in _entries.Values) Start(observer, entry);
+            foreach (var entry in _entries.Values.ToList()) Start(observer, entry);
         }
         return new Unsubscription(() =>
         {
             if (observer.Closed) return;
             observer.Closed = true;
-            foreach (var task in observer.Tasks.Values) task.Cancel();
+            foreach (var task in observer.Tasks.Values.ToList()) task.Cancel();
             observer.Tasks.Clear();
             _observers.Remove(observer);
         });
@@ -126,10 +127,10 @@ public sealed class InstanceDirectory<TEntry> where TEntry : IInstanceDirectoryE
     {
         if (_disposed) return;
         _disposed = true;
-        foreach (var observer in _observers)
+        foreach (var observer in _observers.ToList())
         {
             observer.Closed = true;
-            foreach (var task in observer.Tasks.Values) task.Cancel();
+            foreach (var task in observer.Tasks.Values.ToList()) task.Cancel();
             observer.Tasks.Clear();
         }
         _observers.Clear();
@@ -142,15 +143,16 @@ public sealed class InstanceDirectory<TEntry> where TEntry : IInstanceDirectoryE
         if (!ReferenceEquals(_entries.GetValueOrDefault(entry.Key), entry)) return;
         _entries.Remove(entry.Key);
         entry.Deactivate();
-        foreach (var observer in _observers)
+        foreach (var observer in _observers.ToList())
         {
             if (observer.Tasks.Remove(entry, out var task)) task.Cancel();
         }
     }
 
+    /// <summary>通知每个观察者（处理器可能同步退订或改动目录，所以遍历快照）。</summary>
     private void StartAll(TEntry entry)
     {
-        foreach (var observer in _observers) Start(observer, entry);
+        foreach (var observer in _observers.ToList()) Start(observer, entry);
     }
 
     private void Start(Observer observer, TEntry entry)

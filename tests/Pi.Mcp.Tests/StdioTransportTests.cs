@@ -239,6 +239,111 @@ public class StdioTransportTests
         }
     }
 
+    /// <summary>
+    /// 把每一行当作独立 JSON 解析的回显服务器：解析不了的行记到 stderr（交错的半行就是这么暴露的）。
+    /// </summary>
+    private const string StrictEchoServer = """
+        process.stdin.setEncoding("utf8");
+        let buffer = "";
+        process.stdin.on("data", (chunk) => {
+          buffer += chunk;
+          let newline;
+          while ((newline = buffer.indexOf("\n")) >= 0) {
+            const line = buffer.slice(0, newline);
+            buffer = buffer.slice(newline + 1);
+            if (!line.trim()) continue;
+            let message;
+            try { message = JSON.parse(line); } catch { process.stderr.write("BAD LINE\n"); continue; }
+            if (message.id === undefined) continue;
+            process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: {} }) + "\n");
+          }
+        });
+        process.stdin.on("end", () => process.exit(0));
+        """;
+
+    [Fact]
+    public async Task ConcurrentSendsWriteWholeLines()
+    {
+        var transport = new StdioTransport(EchoOptions(StrictEchoServer));
+        const int count = 200;
+        var responses = new HashSet<long>();
+        var allReceived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var listener = transport.OnMessage(message =>
+        {
+            if (message is not JsonRpcMessage.SuccessResponse success) return;
+            lock (responses)
+            {
+                responses.Add((long)success.Id.Value!);
+                if (responses.Count == count) allReceived.TrySetResult();
+            }
+        });
+
+        try
+        {
+            await transport.StartAsync();
+            // 每条消息都超过 StreamWriter 的内部缓冲，交错时一定跨越多次底层写。
+            var payload = new string('x', 6 * 1024);
+            var start = new TaskCompletionSource();
+            var sends = Enumerable.Range(1, count).Select(id => Task.Run(async () =>
+            {
+                await start.Task;
+                await transport.SendAsync(new JsonRpcMessage.Request(
+                    JsonRpcId.FromNumber(id), "echo", new JsonObject { ["value"] = payload }));
+            })).ToArray();
+            start.SetResult();
+            await Task.WhenAll(sends);
+
+            await allReceived.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            Assert.DoesNotContain("BAD LINE", transport.Stderr, StringComparison.Ordinal);
+        }
+        finally
+        {
+            await transport.CloseAsync();
+        }
+    }
+
+    [Fact]
+    public async Task FinalResponseBeforeExitArrivesBeforeClose()
+    {
+        // 服务器答完最后一条就退出：Exited 事件可能先于 stdout 读尽触发，关闭不能抢在应答之前。
+        const string script = """
+            process.stdin.setEncoding("utf8");
+            let buffer = "";
+            process.stdin.on("data", (chunk) => {
+              buffer += chunk;
+              const newline = buffer.indexOf("\n");
+              if (newline < 0) return;
+              const message = JSON.parse(buffer.slice(0, newline));
+              process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { last: true } }) + "\n");
+              process.exit(0);
+            });
+            """;
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            var transport = new StdioTransport(EchoOptions(script) with { CloseTimeoutMs = 500 });
+            var events = new List<string>();
+            var closed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            using var messages = transport.OnMessage(_ => { lock (events) events.Add("message"); });
+            using var close = transport.OnClose(() =>
+            {
+                lock (events) events.Add("close");
+                closed.TrySetResult();
+            });
+
+            try
+            {
+                await transport.StartAsync();
+                await transport.SendAsync(new JsonRpcMessage.Request(JsonRpcId.FromNumber(1), "last", null));
+                await closed.Task.WaitAsync(TimeSpan.FromSeconds(15));
+                lock (events) Assert.Equal(["message", "close"], events);
+            }
+            finally
+            {
+                await transport.CloseAsync();
+            }
+        }
+    }
+
     [Fact]
     public async Task RejectsSendBeforeStartAndAfterClose()
     {

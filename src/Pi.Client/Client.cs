@@ -52,13 +52,15 @@ public sealed class Client : IAsyncDisposable
 
         public void Start()
         {
-            if (_disposed || active.Ready) return;
-            active.Ready = true;
-            while (active.Queued.Count > 0)
+            // 调用方线程在这里置就绪并排空，读泵线程同时在 HandleMessage 里决定"直达还是排队"：
+            // 两边都在 client._gate 里做，更新才既不丢也不重复、顺序也不乱。
+            // DeliverServiceUpdate 只是往投递尾链上挂续体，不会在闸内运行监听器。
+            lock (client._gate)
             {
-                var update = active.Queued[0];
-                active.Queued.RemoveAt(0);
-                client.DeliverServiceUpdate(active, update);
+                if (_disposed || active.Ready) return;
+                active.Ready = true;
+                foreach (var update in active.Queued) client.DeliverServiceUpdate(active, update);
+                active.Queued.Clear();
             }
         }
 
@@ -66,7 +68,12 @@ public sealed class Client : IAsyncDisposable
         {
             if (_disposed) return;
             _disposed = true;
-            if (ReferenceEquals(client.ServiceListenerOrNull(id), active)) client.RemoveServiceListener(id);
+            Task deliveryTail;
+            lock (client._gate)
+            {
+                if (ReferenceEquals(client.ServiceListenerOrNull(id), active)) client.RemoveServiceListener(id);
+                deliveryTail = active.DeliveryTail;
+            }
             try
             {
                 if (client.Connected && client.TargetIsCurrent(target))
@@ -74,12 +81,15 @@ public sealed class Client : IAsyncDisposable
                     await client.RequestAsync(target, ServiceWire.CreateServiceUnsubscribeCall(id))
                         .ConfigureAwait(false);
                 }
-                await active.DeliveryTail.ConfigureAwait(false);
+                await deliveryTail.ConfigureAwait(false);
             }
             finally
             {
-                active.QueuedWireUpdates.Clear();
-                active.Queued.Clear();
+                lock (client._gate)
+                {
+                    active.QueuedWireUpdates.Clear();
+                    active.Queued.Clear();
+                }
             }
         }
     }
@@ -201,7 +211,8 @@ public sealed class Client : IAsyncDisposable
     public async Task<IServiceSubscription> SubscribeServiceAsync(RpcTarget target, string serviceId,
         ServiceMode mode, Func<ServiceProviderUpdate, Task> listener, CancellationToken signal = default)
     {
-        var subscriptionId = $"service-{++_serviceSubscriptionSequence}";
+        // 多个调用方线程并发订阅：序号原子递增（TS 单线程的 ++ 在这里会重复）。
+        var subscriptionId = $"service-{Interlocked.Increment(ref _serviceSubscriptionSequence)}";
         var active = new ActiveServiceListener
         {
             Target = target,
@@ -257,7 +268,8 @@ public sealed class Client : IAsyncDisposable
         if (!Connected) throw new DisconnectedError();
         if (signal.IsCancellationRequested) throw new OperationCanceledException(signal);
 
-        var id = $"request-{++_requestSequence}";
+        // 重复的请求 id 会让服务端以 invalid_request 拒绝、整条连接随之拆掉：序号必须原子递增。
+        var id = $"request-{Interlocked.Increment(ref _requestSequence)}";
         var completion = PromiseResolvers.Create<T>();
         var sent = false;
         var aborted = false;
@@ -364,8 +376,12 @@ public sealed class Client : IAsyncDisposable
                     _connection.Fail(new ProtocolValidationError(error.Message));
                     return;
                 }
-                if (active.Ready) DeliverServiceUpdate(active, update);
-                else active.Queued.Add(update);
+                // 与 Subscription.Start 的就绪切换互斥（见那里的说明）。
+                lock (_gate)
+                {
+                    if (active.Ready) DeliverServiceUpdate(active, update);
+                    else active.Queued.Add(update);
+                }
                 return;
             }
 
@@ -495,6 +511,7 @@ public sealed class Client : IAsyncDisposable
         }
     }
 
+    /// <summary>把更新挂到该订阅的投递尾链上（调用方持有 <see cref="_gate"/>；监听器在线程池上按序运行）。</summary>
     private void DeliverServiceUpdate(ActiveServiceListener active, ServiceProviderUpdate update)
         => active.DeliveryTail = active.DeliveryTail
             .ContinueWith(_ => active.Listener(update), TaskScheduler.Default)
