@@ -183,6 +183,14 @@ public static partial class TerminalColors
         {
             return null;
         }
-        return (int)JsMath.Round(Convert.ToInt32(channel, 16) / max * 255);
+        // TS: `parseInt(channel, 16) / max * 255`. parseInt yields a double, so an over-long channel
+        // just loses precision and still lands in 0..255. `Convert.ToInt32(channel, 16)` would throw
+        // OverflowException past 8 hex digits and go negative at exactly 8 (bit 31 set).
+        double value = 0;
+        foreach (var c in channel)
+        {
+            value = (value * 16) + Uri.FromHex(c);
+        }
+        return (int)JsMath.Round(value / max * 255);
     }
 }

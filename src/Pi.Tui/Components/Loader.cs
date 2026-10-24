@@ -90,23 +90,29 @@ public class Loader : Text
 
     public void SetIndicator(LoaderIndicatorOptions? indicator = null)
     {
-        _renderIndicatorVerbatim = indicator is not null;
-        _frames = indicator?.Frames is { } frames ? [.. frames] : [.. DefaultFrames];
-        _intervalMs = indicator?.IntervalMs is > 0 ? indicator.IntervalMs.Value : DefaultIntervalMs;
-        _currentFrame = 0;
+        // Assign the frame table under the gate: a tick already dispatched by the previous timer
+        // takes the same lock and must see either the old frames or the new ones, never a half-applied
+        // pair (frames swapped to [] while the tick still divides by their length, see T35).
+        lock (_gate)
+        {
+            _renderIndicatorVerbatim = indicator is not null;
+            _frames = indicator?.Frames is { } frames ? [.. frames] : [.. DefaultFrames];
+            _intervalMs = indicator?.IntervalMs is > 0 ? indicator.IntervalMs.Value : DefaultIntervalMs;
+            _currentFrame = 0;
+        }
         Start();
     }
 
     private void RestartAnimation()
     {
         Stop();
-        if (_frames.Length <= 1)
-        {
-            return;
-        }
-
         lock (_gate)
         {
+            if (_frames.Length <= 1)
+            {
+                return;
+            }
+
             _intervalId = new Timer(
                 _ =>
                 {
@@ -116,7 +122,15 @@ public class Loader : Text
                     // down (the tick half outside the lock was a real race).
                     lock (_gate)
                     {
-                        _currentFrame = (_currentFrame + 1) % _frames.Length;
+                        // SetIndicator may have swapped the frames since this tick was scheduled; an
+                        // empty table hides the indicator and has nothing to advance (`% 0` would throw
+                        // DivideByZeroException on the timer thread and kill the process).
+                        var frames = _frames;
+                        if (frames.Length == 0)
+                        {
+                            return;
+                        }
+                        _currentFrame = (_currentFrame + 1) % frames.Length;
                         UpdateDisplay();
                     }
                 },
@@ -128,8 +142,14 @@ public class Loader : Text
 
     protected string GetRenderedIndicator()
     {
-        var frame = _currentFrame < _frames.Length ? _frames[_currentFrame] : "";
-        return _renderIndicatorVerbatim ? frame : _spinnerColorFn(frame);
+        string frame;
+        bool verbatim;
+        lock (_gate)
+        {
+            frame = _currentFrame < _frames.Length ? _frames[_currentFrame] : "";
+            verbatim = _renderIndicatorVerbatim;
+        }
+        return verbatim ? frame : _spinnerColorFn(frame);
     }
 
     private void UpdateDisplay()

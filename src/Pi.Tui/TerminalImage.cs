@@ -145,7 +145,10 @@ public static partial class TerminalImage
     private static CapabilityOverrides _capabilityOverrides = new();
     private static CellDimensions _cellDimensions = new(9, 18);
 
-    // Kitty image metadata, kept in insertion order so the oldest entry can be evicted.
+    // Kitty image metadata, kept in insertion order so the oldest entry can be evicted. The registry is
+    // process-global and is written by whichever thread renders an Image component while another
+    // render or the layout pass reads it, so every access goes through KittyRegistryGate (T35).
+    private static readonly Lock KittyRegistryGate = new();
     private static readonly Dictionary<long, RegisteredKittyImageMetadata> KittyImageMetadata = new();
     private static readonly List<long> KittyImageOrder = new();
     private static long _kittyTransmissionGeneration;
@@ -527,25 +530,28 @@ public static partial class TerminalImage
 
     public static void RegisterKittyImageMetadata(KittyImageMetadata metadata)
     {
-        _kittyTransmissionGeneration += 1;
-        if (KittyImageMetadata.Remove(metadata.ImageId))
+        lock (KittyRegistryGate)
         {
-            KittyImageOrder.Remove(metadata.ImageId);
-        }
-        KittyImageMetadata[metadata.ImageId] = new RegisteredKittyImageMetadata(
-            metadata.ImageId,
-            metadata.Columns,
-            metadata.Rows,
-            metadata.WidthPx,
-            metadata.HeightPx,
-            _kittyTransmissionGeneration);
-        KittyImageOrder.Add(metadata.ImageId);
+            _kittyTransmissionGeneration += 1;
+            if (KittyImageMetadata.Remove(metadata.ImageId))
+            {
+                KittyImageOrder.Remove(metadata.ImageId);
+            }
+            KittyImageMetadata[metadata.ImageId] = new RegisteredKittyImageMetadata(
+                metadata.ImageId,
+                metadata.Columns,
+                metadata.Rows,
+                metadata.WidthPx,
+                metadata.HeightPx,
+                _kittyTransmissionGeneration);
+            KittyImageOrder.Add(metadata.ImageId);
 
-        if (KittyImageMetadata.Count > 1000 && KittyImageOrder.Count > 0)
-        {
-            var oldestImageId = KittyImageOrder[0];
-            KittyImageOrder.RemoveAt(0);
-            KittyImageMetadata.Remove(oldestImageId);
+            if (KittyImageMetadata.Count > 1000 && KittyImageOrder.Count > 0)
+            {
+                var oldestImageId = KittyImageOrder[0];
+                KittyImageOrder.RemoveAt(0);
+                KittyImageMetadata.Remove(oldestImageId);
+            }
         }
     }
 
@@ -556,8 +562,15 @@ public static partial class TerminalImage
         {
             return null;
         }
-        var imageId = long.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
-        return KittyImageMetadata.TryGetValue(imageId, out var metadata) ? metadata : null;
+        // The capture is unbounded (`[0-9]+`); an id that does not fit a long is simply not registered.
+        if (!long.TryParse(match.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var imageId))
+        {
+            return null;
+        }
+        lock (KittyRegistryGate)
+        {
+            return KittyImageMetadata.TryGetValue(imageId, out var metadata) ? metadata : null;
+        }
     }
 
     private static RegisteredKittyImageMetadata? GetRegisteredKittyImageMetadata(string line)
@@ -573,8 +586,9 @@ public static partial class TerminalImage
         {
             return null;
         }
-        var rows = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
-        return rows > 0 ? rows : null;
+        return int.TryParse(match.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var rows) && rows > 0
+            ? rows
+            : null;
     }
 
     private static int GetKittyImageRowsFromControls(string controls, int fallbackRows) =>

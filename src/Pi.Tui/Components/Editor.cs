@@ -132,8 +132,9 @@ public class Editor : IEditorComponent, IFocusable
         var markers = new List<(int Start, int End)>();
         foreach (Match match in PasteMarkerRegex.Matches(text))
         {
-            var id = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
-            if (!validIds.Contains(id))
+            // 标记里的 id 由用户文本提供、长度无上界：解析不了的 id 不可能是有效登记项。
+            if (!int.TryParse(match.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var id)
+                || !validIds.Contains(id))
             {
                 continue;
             }
@@ -1648,7 +1649,11 @@ public class Editor : IEditorComponent, IFocusable
             "\x1b\\[([0-9]+);5u",
             match =>
             {
-                var code = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
+                // 粘贴内容可以含任意长的数字：溢出时按原样保留，而不是让 HandlePaste 抛 OverflowException。
+                if (!int.TryParse(match.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var code))
+                {
+                    return match.Value;
+                }
                 if (code is >= 97 and <= 122)
                 {
                     return ((char)(code - 96)).ToString();
@@ -1789,9 +1794,9 @@ public class Editor : IEditorComponent, IFocusable
             var graphemeLength = graphemes.Count > 0 ? lastGrapheme.Length : 1;
             var pasteMatch = graphemes.Count > 0 ? PasteMarkerSingle.Match(lastGrapheme) : null;
 
-            if (pasteMatch is { Success: true })
+            if (pasteMatch is { Success: true }
+                && int.TryParse(pasteMatch.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var targetId))
             {
-                var targetId = int.Parse(pasteMatch.Groups[1].Value, CultureInfo.InvariantCulture);
                 _pastes.Remove(targetId);
                 _pasteCounter--;
 
@@ -1810,8 +1815,8 @@ public class Editor : IEditorComponent, IFocusable
                         _state.Lines[i],
                         match =>
                         {
-                            var x = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
-                            if (x <= targetId)
+                            if (!int.TryParse(match.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var x)
+                                || x <= targetId)
                             {
                                 return match.Value;
                             }

@@ -110,6 +110,10 @@ public sealed class MarkedLexer
 
             // marked tries the registered block extensions before any built-in tokenizer:
             // extensions.block.some(o => (r = o.call({lexer}, src, tokens)) ? (src = src.substring(r.raw.length), tokens.push(r), true) : false)
+            // Every advance below goes through JsString.Substring rather than a C# range: marked's own
+            // blockquote tokenizer can report a `raw` one character longer than the remaining source
+            // (its list-continuation branch leaves `lines = [""]` and appends "\n"), which JS substring
+            // clamps to "" while `src[raw.Length..]` would throw ArgumentOutOfRangeException.
             if (extensions is not null)
             {
                 foreach (var extension in extensions.Block)
@@ -117,7 +121,7 @@ public sealed class MarkedLexer
                     token = extension(this, src, tokens);
                     if (token is not null)
                     {
-                        src = src[token.Raw.Length..];
+                        src = JsString.Substring(src, token.Raw.Length);
                         tokens.Add(token);
                         break;
                     }
@@ -134,7 +138,7 @@ public sealed class MarkedLexer
                 token = Tokenizer.Space(src);
                 if (token is not null)
                 {
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     if (token.Raw.Length == 1 && last is not null)
                     {
                         // A single blank line just extends the previous token's raw text.
@@ -153,7 +157,7 @@ public sealed class MarkedLexer
                 token = Tokenizer.Code(src);
                 if (token is not null)
                 {
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     if (last?.Type is "paragraph" or "text")
                     {
                         last.Raw += (last.Raw.EndsWith('\n') ? "" : "\n") + token.Raw;
@@ -173,7 +177,7 @@ public sealed class MarkedLexer
                 token = Tokenizer.Fences(src);
                 if (token is not null)
                 {
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     tokens.Add(token);
                     continue;
                 }
@@ -184,7 +188,7 @@ public sealed class MarkedLexer
                 token = Tokenizer.Heading(src);
                 if (token is not null)
                 {
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     tokens.Add(token);
                     continue;
                 }
@@ -195,7 +199,7 @@ public sealed class MarkedLexer
                 token = Tokenizer.Hr(src);
                 if (token is not null)
                 {
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     tokens.Add(token);
                     continue;
                 }
@@ -206,7 +210,7 @@ public sealed class MarkedLexer
                 token = Tokenizer.Blockquote(src);
                 if (token is not null)
                 {
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     tokens.Add(token);
                     continue;
                 }
@@ -217,7 +221,7 @@ public sealed class MarkedLexer
                 token = Tokenizer.List(src);
                 if (token is not null)
                 {
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     tokens.Add(token);
                     continue;
                 }
@@ -228,7 +232,7 @@ public sealed class MarkedLexer
                 token = Tokenizer.Html(src);
                 if (token is not null)
                 {
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     tokens.Add(token);
                     continue;
                 }
@@ -239,7 +243,7 @@ public sealed class MarkedLexer
                 token = Tokenizer.Def(src);
                 if (token is not null)
                 {
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     if (last?.Type is "paragraph" or "text")
                     {
                         last.Raw += (last.Raw.EndsWith('\n') ? "" : "\n") + token.Raw;
@@ -264,7 +268,7 @@ public sealed class MarkedLexer
                 token = Tokenizer.Table(src);
                 if (token is not null)
                 {
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     tokens.Add(token);
                     continue;
                 }
@@ -275,7 +279,7 @@ public sealed class MarkedLexer
                 token = Tokenizer.Lheading(src);
                 if (token is not null)
                 {
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     tokens.Add(token);
                     continue;
                 }
@@ -323,7 +327,7 @@ public sealed class MarkedLexer
                     // marked records whether the startBlock extensions clipped the source this
                     // time; the next paragraph merges into the previous token when they did.
                     lastParagraphClipped = paragraphSrc.Length != src.Length;
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     continue;
                 }
             }
@@ -333,7 +337,7 @@ public sealed class MarkedLexer
                 token = Tokenizer.Text(src);
                 if (token is not null)
                 {
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     if (last?.Type == "text")
                     {
                         last.Raw += (last.Raw.EndsWith('\n') ? "" : "\n") + token.Raw;
@@ -444,7 +448,7 @@ public sealed class MarkedLexer
                     token = extension(this, src, tokens);
                     if (token is not null)
                     {
-                        src = src[token.Raw.Length..];
+                        src = JsString.Substring(src, token.Raw.Length);
                         tokens.Add(token);
                         break;
                     }
@@ -461,7 +465,7 @@ public sealed class MarkedLexer
                 token = Tokenizer.Escape(src);
                 if (token is not null)
                 {
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     tokens.Add(token);
                     continue;
                 }
@@ -472,7 +476,7 @@ public sealed class MarkedLexer
                 token = Tokenizer.Tag(src);
                 if (token is not null)
                 {
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     tokens.Add(token);
                     continue;
                 }
@@ -483,7 +487,7 @@ public sealed class MarkedLexer
                 token = Tokenizer.Link(src);
                 if (token is not null)
                 {
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     tokens.Add(token);
                     continue;
                 }
@@ -494,7 +498,7 @@ public sealed class MarkedLexer
                 token = Tokenizer.Reflink(src, Links);
                 if (token is not null)
                 {
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     if (token.Type == "text" && tokens.Count > 0 && tokens[^1].Type == "text")
                     {
                         tokens[^1].Raw += token.Raw;
@@ -513,7 +517,7 @@ public sealed class MarkedLexer
                 token = Tokenizer.EmStrong(src, masked, previous);
                 if (token is not null)
                 {
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     tokens.Add(token);
                     continue;
                 }
@@ -524,7 +528,7 @@ public sealed class MarkedLexer
                 token = Tokenizer.Codespan(src);
                 if (token is not null)
                 {
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     tokens.Add(token);
                     continue;
                 }
@@ -535,7 +539,7 @@ public sealed class MarkedLexer
                 token = Tokenizer.Br(src);
                 if (token is not null)
                 {
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     tokens.Add(token);
                     continue;
                 }
@@ -546,7 +550,7 @@ public sealed class MarkedLexer
                 token = Tokenizer.Del(src, masked, previous);
                 if (token is not null)
                 {
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     tokens.Add(token);
                     continue;
                 }
@@ -557,7 +561,7 @@ public sealed class MarkedLexer
                 token = Tokenizer.Autolink(src);
                 if (token is not null)
                 {
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     tokens.Add(token);
                     continue;
                 }
@@ -568,7 +572,7 @@ public sealed class MarkedLexer
                 token = Tokenizer.Url(src);
                 if (token is not null)
                 {
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     tokens.Add(token);
                     continue;
                 }
@@ -600,7 +604,7 @@ public sealed class MarkedLexer
                 token = Tokenizer.InlineText(inlineTextSrc);
                 if (token is not null)
                 {
-                    src = src[token.Raw.Length..];
+                    src = JsString.Substring(src, token.Raw.Length);
                     if (!token.Raw.EndsWith('_'))
                     {
                         previous = token.Raw[^1].ToString();

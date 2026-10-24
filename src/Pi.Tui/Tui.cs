@@ -237,7 +237,21 @@ public abstract partial class TuiBase : Container, ITui
     private static readonly Stopwatch Clock = Stopwatch.StartNew();
 
     private readonly object _renderLock = new();
-    private readonly HashSet<Func<string, TuiInputListenerResult?>> _inputListeners = new();
+
+    /// <summary>
+    /// 对应 TS 的 <c>Set&lt;InputListener&gt;</c>：迭代顺序是首次插入顺序。必须用 List 而不是
+    /// HashSet——HashSet 会复用删除后空出的槽位，使「加 A,B,C；删 A；加 D」按 D,B,C 而不是 B,C,D 触发。
+    /// 监听器可由任意线程增删（扩展在 agent 线程上注册），故增删与快照都在 <see cref="_inputListenersGate"/> 下。
+    /// </summary>
+    private readonly Lock _inputListenersGate = new();
+    private readonly List<Func<string, TuiInputListenerResult?>> _inputListeners = new();
+
+    /// <summary>
+    /// overlay 栈的增删与枚举都在这把锁下（T35）：<see cref="ShowOverlay"/> / <c>Hide</c> 可能来自 agent 线程，
+    /// 而 <see cref="CompositeOverlays"/> 在渲染线程上枚举它；直接枚举 List 会在并发修改时抛
+    /// 「Collection was modified」并杀死进程。读方统一拿快照（<see cref="SnapshotOverlayStack"/>）。
+    /// </summary>
+    private readonly Lock _overlayGate = new();
     private readonly List<OverlayStackEntry> _overlayStack = new();
 
     /// <summary>
@@ -250,8 +264,19 @@ public abstract partial class TuiBase : Container, ITui
     private IComponent? _focusedComponent;
     private bool _renderRequested;
     private bool _immediateRenderScheduled;
-    private int _rendersInProgress;
-    private readonly Dictionary<int, int> _renderThreadsInProgress = [];
+
+    /// <summary>
+    /// 渲染互斥（T35）：<see cref="_renderOwnerThread"/> 是正在执行 <see cref="DoRender"/> 的线程
+    /// （0 表示没有），<see cref="_renderDepth"/> 记录同一线程的重入层数。二者只在 <see cref="_renderLock"/> 下读写。
+    /// </summary>
+    private int _renderOwnerThread;
+    private int _renderDepth;
+
+    /// <summary>
+    /// <c>force</c> 渲染请求的 <see cref="ResetRenderState"/> 延迟到真正拿到渲染权时执行，
+    /// 避免在另一线程的 DoRender 中途清掉它正在差分的 <c>_previousLines</c>。
+    /// </summary>
+    private bool _resetRenderStatePending;
     private Timer? _renderTimer;
     private long _lastRenderAt;
     private int _focusOrderCounter;
@@ -312,7 +337,33 @@ public abstract partial class TuiBase : Container, ITui
 
     protected virtual IReadOnlyList<IComponent> GetMountedRoots() => GetChildrenSnapshot();
 
-    protected bool HasOverlayEntries => _overlayStack.Count > 0;
+    protected bool HasOverlayEntries
+    {
+        get
+        {
+            lock (_overlayGate)
+            {
+                return _overlayStack.Count > 0;
+            }
+        }
+    }
+
+    /// <summary>栈的只读快照（按栈序）。渲染/输入/焦点代码都用它枚举，栈本身只在 <see cref="_overlayGate"/> 下改动。</summary>
+    private OverlayStackEntry[] SnapshotOverlayStack()
+    {
+        lock (_overlayGate)
+        {
+            return _overlayStack.ToArray();
+        }
+    }
+
+    private bool ContainsOverlay(OverlayStackEntry entry)
+    {
+        lock (_overlayGate)
+        {
+            return _overlayStack.Contains(entry);
+        }
+    }
 
     /// <summary>Mode resets written before the terminal's own resets when the process exits without stop.</summary>
     protected virtual string GetExitRestorePrefix() =>
@@ -386,7 +437,7 @@ public abstract partial class TuiBase : Container, ITui
         var previousFocusedOverlay = previousFocus is not null
             ? FindOverlay(previousFocus, visibleOnly: true)
             : null;
-        var nextFocusIsOverlay = nextFocus is not null && _overlayStack.Any(e => e.Component == nextFocus);
+        var nextFocusIsOverlay = nextFocus is not null && SnapshotOverlayStack().Any(e => e.Component == nextFocus);
         var restoreState = GetVisibleOverlayFocusRestore();
 
         if (nextFocus is not null && !nextFocusIsOverlay)
@@ -469,7 +520,7 @@ public abstract partial class TuiBase : Container, ITui
         {
             return state;
         }
-        if (state.Overlay is null || !_overlayStack.Contains(state.Overlay) || !IsOverlayVisible(state.Overlay))
+        if (state.Overlay is null || !ContainsOverlay(state.Overlay) || !IsOverlayVisible(state.Overlay))
         {
             return OverlayFocusRestoreState.Inactive;
         }
@@ -486,14 +537,14 @@ public abstract partial class TuiBase : Container, ITui
             {
                 return true;
             }
-            current = _overlayStack.FirstOrDefault(o => o.Component == current)?.PreFocus;
+            current = SnapshotOverlayStack().FirstOrDefault(o => o.Component == current)?.PreFocus;
         }
         return false;
     }
 
     private void RetargetOverlayPreFocus(OverlayStackEntry removed)
     {
-        foreach (var overlay in _overlayStack)
+        foreach (var overlay in SnapshotOverlayStack())
         {
             if (overlay != removed && overlay.PreFocus == removed.Component)
             {
@@ -524,7 +575,7 @@ public abstract partial class TuiBase : Container, ITui
 
     private OverlayStackEntry? FindOverlay(IComponent component, bool visibleOnly)
     {
-        foreach (var entry in _overlayStack)
+        foreach (var entry in SnapshotOverlayStack())
         {
             if (entry.Component == component && (!visibleOnly || IsOverlayVisible(entry)))
             {
@@ -544,7 +595,10 @@ public abstract partial class TuiBase : Container, ITui
             Hidden = false,
             FocusOrder = ++_focusOrderCounter,
         };
-        _overlayStack.Add(entry);
+        lock (_overlayGate)
+        {
+            _overlayStack.Add(entry);
+        }
         if (!(options?.NonCapturing ?? false) && IsOverlayVisible(entry))
         {
             SetFocus(component);
@@ -556,18 +610,19 @@ public abstract partial class TuiBase : Container, ITui
 
     public void HideOverlay()
     {
-        if (_overlayStack.Count == 0)
+        var stack = SnapshotOverlayStack();
+        if (stack.Length == 0)
         {
             return;
         }
-        var overlay = _overlayStack[^1];
+        var overlay = stack[^1];
         RemoveOverlayEntry(overlay);
         if (_focusedComponent == overlay.Component)
         {
             var topVisible = GetTopmostVisibleOverlay();
             SetFocus(topVisible?.Component ?? overlay.PreFocus);
         }
-        if (_overlayStack.Count == 0)
+        if (!HasOverlayEntries)
         {
             HideTerminalCursor();
         }
@@ -587,21 +642,25 @@ public abstract partial class TuiBase : Container, ITui
     {
         ClearOverlayFocusRestoreFor(entry);
         RetargetOverlayPreFocus(entry);
-        _overlayStack.Remove(entry);
+        lock (_overlayGate)
+        {
+            _overlayStack.Remove(entry);
+        }
     }
 
-    public bool HasOverlay() => _overlayStack.Any(IsOverlayVisible);
+    public bool HasOverlay() => SnapshotOverlayStack().Any(IsOverlayVisible);
 
     /// <summary>Check if the focused component is a visible overlay.</summary>
     protected bool IsOverlayFocused() =>
-        _overlayStack.Any(entry => entry.Component == _focusedComponent && IsOverlayVisible(entry));
+        SnapshotOverlayStack().Any(entry => entry.Component == _focusedComponent && IsOverlayVisible(entry));
 
     /// <summary>Keep overlay containers as keyboard focus owners when a nested control is clicked.</summary>
     protected IComponent ResolveMouseFocusTarget(IComponent component)
     {
-        for (var index = _overlayStack.Count - 1; index >= 0; index--)
+        var stack = SnapshotOverlayStack();
+        for (var index = stack.Length - 1; index >= 0; index--)
         {
-            var overlay = _overlayStack[index];
+            var overlay = stack[index];
             if (IsOverlayVisible(overlay) && ContainsComponent(overlay.Component, component))
             {
                 return overlay.Component;
@@ -658,7 +717,7 @@ public abstract partial class TuiBase : Container, ITui
     private OverlayStackEntry? GetTopmostVisibleOverlay()
     {
         OverlayStackEntry? topmost = null;
-        foreach (var overlay in _overlayStack)
+        foreach (var overlay in SnapshotOverlayStack())
         {
             if ((overlay.Options?.NonCapturing ?? false) || !IsOverlayVisible(overlay))
             {
@@ -685,7 +744,7 @@ public abstract partial class TuiBase : Container, ITui
 
         public void Hide()
         {
-            if (!_tui._overlayStack.Contains(_entry))
+            if (!_tui.ContainsOverlay(_entry))
             {
                 return;
             }
@@ -695,7 +754,7 @@ public abstract partial class TuiBase : Container, ITui
                 var topVisible = _tui.GetTopmostVisibleOverlay();
                 _tui.SetFocus(topVisible?.Component ?? _entry.PreFocus);
             }
-            if (_tui._overlayStack.Count == 0)
+            if (!_tui.HasOverlayEntries)
             {
                 _tui.HideTerminalCursor();
             }
@@ -730,7 +789,7 @@ public abstract partial class TuiBase : Container, ITui
 
         public void Focus()
         {
-            if (!_tui._overlayStack.Contains(_entry) || !_tui.IsOverlayVisible(_entry))
+            if (!_tui.ContainsOverlay(_entry) || !_tui.IsOverlayVisible(_entry))
             {
                 return;
             }
@@ -778,7 +837,7 @@ public abstract partial class TuiBase : Container, ITui
 
         public OverlayBounds? GetBounds()
         {
-            if (!_tui._overlayStack.Contains(_entry) || !_tui.IsOverlayVisible(_entry) || _entry.Bounds is null)
+            if (!_tui.ContainsOverlay(_entry) || !_tui.IsOverlayVisible(_entry) || _entry.Bounds is null)
             {
                 return null;
             }
@@ -793,7 +852,7 @@ public abstract partial class TuiBase : Container, ITui
         {
             root.Invalidate();
         }
-        foreach (var overlay in _overlayStack)
+        foreach (var overlay in SnapshotOverlayStack())
         {
             overlay.Component.Invalidate();
         }
@@ -831,7 +890,7 @@ public abstract partial class TuiBase : Container, ITui
             // 另一个线程上越过 _stopped 检查，故等待进行中的渲染结束，避免 Stop 返回后仍访问终端/主题。
             // 渲染线程自身会调用 Stop（超宽行触发致命错误），不能等待自己，否则死锁。
             var currentThread = Environment.CurrentManagedThreadId;
-            while (_rendersInProgress - _renderThreadsInProgress.GetValueOrDefault(currentThread) > 0)
+            while (_renderDepth > 0 && _renderOwnerThread != currentThread)
             {
                 Monitor.Wait(_renderLock);
             }
@@ -848,29 +907,49 @@ public abstract partial class TuiBase : Container, ITui
 
     public Action AddInputListener(Func<string, TuiInputListenerResult?> listener)
     {
-        _inputListeners.Add(listener);
-        return () => _inputListeners.Remove(listener);
+        lock (_inputListenersGate)
+        {
+            // JS Set：重复添加同一个监听器是空操作。
+            if (!_inputListeners.Contains(listener))
+            {
+                _inputListeners.Add(listener);
+            }
+        }
+        return () => RemoveInputListener(listener);
     }
 
-    public void RemoveInputListener(Func<string, TuiInputListenerResult?> listener) => _inputListeners.Remove(listener);
+    public void RemoveInputListener(Func<string, TuiInputListenerResult?> listener)
+    {
+        lock (_inputListenersGate)
+        {
+            _inputListeners.Remove(listener);
+        }
+    }
 
     public void RenderNow(bool force = false)
     {
-        if (force)
+        lock (_renderLock)
         {
-            ResetRenderState();
+            if (force)
+            {
+                _resetRenderStatePending = true;
+            }
+            _renderRequested = false;
+            CancelRenderTimerLocked();
+            _lastRenderAt = NowMs();
         }
-        _renderRequested = false;
-        CancelRenderTimer();
-        _lastRenderAt = NowMs();
-        RenderGuarded();
+        // 同步语义：若另一线程正在渲染，等它结束后再渲染，而不是合并进后续渲染。
+        RenderGuarded(wait: true);
     }
 
     public void RequestRender(bool force = false)
     {
         if (force)
         {
-            ResetRenderState();
+            lock (_renderLock)
+            {
+                _resetRenderStatePending = true;
+            }
             RequestImmediateRender();
             return;
         }
@@ -910,45 +989,79 @@ public abstract partial class TuiBase : Container, ITui
                 _renderRequested = false;
                 _lastRenderAt = NowMs();
             }
-            RenderGuarded();
+            RenderGuarded(wait: false);
         });
     }
 
-    private void CancelRenderTimer()
-    {
-        lock (_renderLock)
-        {
-            CancelRenderTimerLocked();
-        }
-    }
-
     /// <summary>
-    /// 在 <see cref="Stop"/> 可观察的停止点内执行渲染：Stop 会等待已开始的渲染结束，
-    /// 从而保证返回后不再访问终端或主题。
+    /// 串行化渲染（T35）：TS 的单线程事件循环天然保证同一时刻只有一个 render；.NET 的渲染来自
+    /// Timer 线程、线程池（<see cref="RequestImmediateRender"/>）与调用方线程（<see cref="RenderNow"/>），
+    /// 而 <see cref="DoRender"/> 全程读写同一份差分状态（<c>_previousLines</c>、硬件光标行等），
+    /// 并发会撕裂帧。因此同一时刻只允许一个 DoRender：
+    /// <list type="bullet">
+    /// <item><paramref name="wait"/> 为 false（计时器 / 线程池路径）时，遇到正在进行的渲染就把请求
+    /// 合并成一次后续渲染——置 <c>_renderRequested</c>，由当前渲染结束时统一 <see cref="ScheduleRender"/>，
+    /// 恰好一次、不会丢。</item>
+    /// <item><paramref name="wait"/> 为 true（<see cref="RenderNow"/>）时等待当前渲染结束后再渲染，保持同步语义。</item>
+    /// <item>同一线程的重入（渲染中触发 RenderNow）仍按原样嵌套执行，不会自锁。</item>
+    /// </list>
+    /// 它同时是 <see cref="Stop"/> 可观察的停止点：Stop 会等待已开始的渲染结束，从而保证返回后不再访问终端或主题。
     /// </summary>
-    private void RenderGuarded()
+    private void RenderGuarded(bool wait)
     {
         var threadId = Environment.CurrentManagedThreadId;
+        var reset = false;
         lock (_renderLock)
         {
-            if (_stopped) return;
-            _rendersInProgress++;
-            _renderThreadsInProgress[threadId] = _renderThreadsInProgress.GetValueOrDefault(threadId) + 1;
+            while (_renderDepth > 0 && _renderOwnerThread != threadId)
+            {
+                if (_stopped)
+                {
+                    return;
+                }
+                if (!wait)
+                {
+                    _renderRequested = true;
+                    return;
+                }
+                Monitor.Wait(_renderLock);
+            }
+            if (_stopped)
+            {
+                return;
+            }
+            _renderOwnerThread = threadId;
+            _renderDepth++;
+            if (_resetRenderStatePending)
+            {
+                _resetRenderStatePending = false;
+                reset = true;
+            }
         }
+        var followUp = false;
         try
         {
+            if (reset)
+            {
+                ResetRenderState();
+            }
             DoRender();
         }
         finally
         {
             lock (_renderLock)
             {
-                _rendersInProgress--;
-                var remaining = _renderThreadsInProgress.GetValueOrDefault(threadId) - 1;
-                if (remaining == 0) _renderThreadsInProgress.Remove(threadId);
-                else _renderThreadsInProgress[threadId] = remaining;
-                if (_rendersInProgress == 0) Monitor.PulseAll(_renderLock);
+                if (--_renderDepth == 0)
+                {
+                    _renderOwnerThread = 0;
+                    Monitor.PulseAll(_renderLock);
+                    followUp = _renderRequested && !_stopped;
+                }
             }
+        }
+        if (followUp)
+        {
+            ScheduleRender();
         }
     }
 
@@ -985,7 +1098,7 @@ public abstract partial class TuiBase : Container, ITui
             _renderRequested = false;
             _lastRenderAt = NowMs();
         }
-        RenderGuarded();
+        RenderGuarded(wait: false);
         lock (_renderLock)
         {
             if (_renderRequested)
@@ -1006,10 +1119,15 @@ public abstract partial class TuiBase : Container, ITui
             return;
         }
 
-        if (_inputListeners.Count > 0)
+        Func<string, TuiInputListenerResult?>[] listeners;
+        lock (_inputListenersGate)
+        {
+            listeners = _inputListeners.ToArray();
+        }
+        if (listeners.Length > 0)
         {
             var current = data;
-            foreach (var listener in _inputListeners.ToArray())
+            foreach (var listener in listeners)
             {
                 var result = listener(current);
                 if (result?.Consume ?? false)
@@ -1040,7 +1158,8 @@ public abstract partial class TuiBase : Container, ITui
             return;
         }
 
-        var focusedOverlay = _overlayStack.FirstOrDefault(o => o.Component == _focusedComponent);
+        var overlayStack = SnapshotOverlayStack();
+        var focusedOverlay = overlayStack.FirstOrDefault(o => o.Component == _focusedComponent);
         if (focusedOverlay is not null && !IsOverlayVisible(focusedOverlay))
         {
             var topVisible = GetTopmostVisibleOverlay();
@@ -1054,7 +1173,7 @@ public abstract partial class TuiBase : Container, ITui
             }
         }
 
-        var focusIsOverlay = _overlayStack.Any(o => o.Component == _focusedComponent);
+        var focusIsOverlay = overlayStack.Any(o => o.Component == _focusedComponent);
         if (!focusIsOverlay)
         {
             var restoreState = GetVisibleOverlayFocusRestore();
@@ -1093,14 +1212,16 @@ public abstract partial class TuiBase : Container, ITui
 
     protected string[] CompositeOverlays(string[] lines, int termWidth, int termHeight)
     {
-        if (_overlayStack.Count == 0)
+        // 整个合成过程只看一份快照：ShowOverlay / Hide 可能在合成中途从别的线程改栈。
+        var overlayStack = SnapshotOverlayStack();
+        if (overlayStack.Length == 0)
         {
             _renderedOverlayLayouts = new List<RenderedOverlayLayout>();
             return lines;
         }
         var result = new List<string>(lines);
 
-        foreach (var entry in _overlayStack)
+        foreach (var entry in overlayStack)
         {
             entry.Bounds = null;
         }
@@ -1108,7 +1229,7 @@ public abstract partial class TuiBase : Container, ITui
         var rendered = new List<(OverlayStackEntry Entry, string[] OverlayLines, int Row, int Col, int Width)>();
         var minLinesNeeded = result.Count;
 
-        var visibleEntries = _overlayStack.Where(IsOverlayVisible).OrderBy(e => e.FocusOrder).ToList();
+        var visibleEntries = overlayStack.Where(IsOverlayVisible).OrderBy(e => e.FocusOrder).ToList();
         foreach (var entry in visibleEntries)
         {
             var initialLayout = ResolveOverlayLayoutFull(entry.Options, 0, termWidth, termHeight);
@@ -1487,9 +1608,11 @@ public abstract partial class TuiBase : Container, ITui
             return false;
         }
 
-        var heightPx = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
-        var widthPx = int.Parse(match.Groups[2].Value, CultureInfo.InvariantCulture);
-        if (heightPx <= 0 || widthPx <= 0)
+        // 捕获组无上界；解析不了的尺寸当作无效回复吞掉，不能在输入线程上抛 OverflowException。
+        if (!int.TryParse(match.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var heightPx)
+            || !int.TryParse(match.Groups[2].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var widthPx)
+            || heightPx <= 0
+            || widthPx <= 0)
         {
             return true;
         }

@@ -63,6 +63,26 @@ public static class JsString
     }
 
     /// <summary>
+    /// JavaScript <c>String.prototype.substring(start, end)</c>. Unlike <see cref="Slice"/>, negative
+    /// indices clamp to zero (they never count from the end), indices past the end clamp to the length,
+    /// and the two are swapped when out of order. In particular <c>substring(n)</c> with
+    /// <c>n &gt; length</c> yields <c>""</c> where a C# range would throw — marked's lexer relies on
+    /// that when a tokenizer reports a <c>raw</c> longer than the remaining source.
+    /// </summary>
+    public static string Substring(string value, int start, int? end = null)
+    {
+        var length = value.Length;
+        var from = Math.Clamp(start, 0, length);
+        var to = end is null ? length : Math.Clamp(end.Value, 0, length);
+        if (from > to)
+        {
+            (from, to) = (to, from);
+        }
+
+        return from == to ? "" : value.Substring(from, to - from);
+    }
+
+    /// <summary>
     /// JavaScript <c>String.prototype[i]</c>: reads <c>undefined</c> (falsy) past the end. The
     /// sentinel <c>'\0'</c> stands in for <c>undefined</c>; it is never a real delimiter or wrapper.
     /// </summary>

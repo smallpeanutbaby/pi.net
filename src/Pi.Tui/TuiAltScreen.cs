@@ -1116,7 +1116,13 @@ public sealed class TuiAltScreen : TuiBase, IViewportTui
         var sgr = SgrWheelPattern.Match(data);
         if (sgr.Success)
         {
-            var button = int.Parse(sgr.Groups[1].Value, CultureInfo.InvariantCulture);
+            // 捕获组无上界：溢出的参数视为不是鼠标事件，而不是在输入线程上抛 OverflowException。
+            if (!int.TryParse(sgr.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var button)
+                || !int.TryParse(sgr.Groups[2].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var x)
+                || !int.TryParse(sgr.Groups[3].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var y))
+            {
+                return null;
+            }
             if ((button & 64) == 0)
             {
                 return null;
@@ -1129,8 +1135,8 @@ public sealed class TuiAltScreen : TuiBase, IViewportTui
             return new WheelEvent
             {
                 Direction = direction == 0 ? -1 : 1,
-                X = int.Parse(sgr.Groups[2].Value, CultureInfo.InvariantCulture) - 1,
-                Y = int.Parse(sgr.Groups[3].Value, CultureInfo.InvariantCulture) - 1,
+                X = x - 1,
+                Y = y - 1,
                 Button = button,
             };
         }
@@ -1182,15 +1188,18 @@ public sealed class TuiAltScreen : TuiBase, IViewportTui
     private static SgrMouseEvent? ParseSgrMouseEvent(string data)
     {
         var match = SgrMousePattern.Match(data);
-        if (!match.Success)
+        if (!match.Success
+            || !int.TryParse(match.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var button)
+            || !int.TryParse(match.Groups[2].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var x)
+            || !int.TryParse(match.Groups[3].Value, NumberStyles.None, CultureInfo.InvariantCulture, out var y))
         {
             return null;
         }
         return new SgrMouseEvent
         {
-            Button = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture),
-            X = int.Parse(match.Groups[2].Value, CultureInfo.InvariantCulture) - 1,
-            Y = int.Parse(match.Groups[3].Value, CultureInfo.InvariantCulture) - 1,
+            Button = button,
+            X = x - 1,
+            Y = y - 1,
             Release = match.Groups[4].Value == "m",
         };
     }

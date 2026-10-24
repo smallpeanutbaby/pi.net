@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.RegularExpressions;
 
 namespace Pi.Tui;
@@ -246,24 +247,53 @@ public static partial class Keys
 
     private readonly record struct KittySequence(int Codepoint, int? ShiftedKey, int? BaseLayoutKey, int Modifier, KeyEventType EventType);
 
+    /// <summary>
+    /// 解析 CSI 参数。捕获组是无上界的 <c>[0-9]+</c>，JS 的 <c>parseInt</c> 对超长数字只是得到一个
+    /// 不会命中的大数，而 <c>int.Parse</c> 会抛 <see cref="OverflowException"/>（输入线程崩溃）。
+    /// 溢出一律视为「不是该序列」。
+    /// </summary>
+    private static bool TryParseCsiParameter(string text, out int value) =>
+        int.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out value);
+
+    /// <summary>Optional CSI sub-parameter: an absent/empty group yields <paramref name="fallback"/>, an overflow fails.</summary>
+    private static bool TryParseOptionalCsiParameter(Group group, int? fallback, out int? value)
+    {
+        value = fallback;
+        if (!group.Success || group.Value.Length == 0)
+        {
+            return true;
+        }
+        if (!TryParseCsiParameter(group.Value, out var parsed))
+        {
+            return false;
+        }
+        value = parsed;
+        return true;
+    }
+
     private static KittySequence? ParseKittySequence(string data)
     {
         var m = CsiURegex().Match(data);
         if (m.Success)
         {
-            var codepoint = int.Parse(m.Groups[1].Value);
-            var shiftedRaw = m.Groups[2].Value;
-            int? shiftedKey = m.Groups[2].Success && shiftedRaw.Length > 0 ? int.Parse(shiftedRaw) : null;
-            int? baseLayoutKey = m.Groups[3].Success ? int.Parse(m.Groups[3].Value) : null;
-            var modValue = m.Groups[4].Success ? int.Parse(m.Groups[4].Value) : 1;
+            if (!TryParseCsiParameter(m.Groups[1].Value, out var codepoint)
+                || !TryParseOptionalCsiParameter(m.Groups[2], null, out var shiftedKey)
+                || !TryParseOptionalCsiParameter(m.Groups[3], null, out var baseLayoutKey)
+                || !TryParseOptionalCsiParameter(m.Groups[4], 1, out var modValue))
+            {
+                return null;
+            }
             var eventType = ParseEventType(m.Groups[5].Success ? m.Groups[5].Value : null);
-            return new KittySequence(codepoint, shiftedKey, baseLayoutKey, modValue - 1, eventType);
+            return new KittySequence(codepoint, shiftedKey, baseLayoutKey, modValue!.Value - 1, eventType);
         }
 
         var arrow = ArrowRegex().Match(data);
         if (arrow.Success)
         {
-            var modValue = int.Parse(arrow.Groups[1].Value);
+            if (!TryParseCsiParameter(arrow.Groups[1].Value, out var modValue))
+            {
+                return null;
+            }
             var eventType = ParseEventType(arrow.Groups[2].Success ? arrow.Groups[2].Value : null);
             var code = arrow.Groups[3].Value switch { "A" => CpUp, "B" => CpDown, "C" => CpRight, _ => CpLeft };
             return new KittySequence(code, null, null, modValue - 1, eventType);
@@ -272,8 +302,12 @@ public static partial class Keys
         var func = FuncRegex().Match(data);
         if (func.Success)
         {
-            var keyNum = int.Parse(func.Groups[1].Value);
-            var modValue = func.Groups[2].Success ? int.Parse(func.Groups[2].Value) : 1;
+            if (!TryParseCsiParameter(func.Groups[1].Value, out var keyNum)
+                || !TryParseOptionalCsiParameter(func.Groups[2], 1, out var modValueOrNull))
+            {
+                return null;
+            }
+            var modValue = modValueOrNull!.Value;
             var eventType = ParseEventType(func.Groups[3].Success ? func.Groups[3].Value : null);
             int? code = keyNum switch
             {
@@ -294,7 +328,10 @@ public static partial class Keys
         var homeEnd = HomeEndRegex().Match(data);
         if (homeEnd.Success)
         {
-            var modValue = int.Parse(homeEnd.Groups[1].Value);
+            if (!TryParseCsiParameter(homeEnd.Groups[1].Value, out var modValue))
+            {
+                return null;
+            }
             var eventType = ParseEventType(homeEnd.Groups[2].Success ? homeEnd.Groups[2].Value : null);
             var code = homeEnd.Groups[3].Value == "H" ? CpHome : CpEnd;
             return new KittySequence(code, null, null, modValue - 1, eventType);
@@ -353,11 +390,13 @@ public static partial class Keys
     private static (int Codepoint, int Modifier)? ParseModifyOtherKeysSequence(string data)
     {
         var m = ModifyOtherKeysRegex().Match(data);
-        if (!m.Success)
+        if (!m.Success
+            || !TryParseCsiParameter(m.Groups[2].Value, out var codepoint)
+            || !TryParseCsiParameter(m.Groups[1].Value, out var modValue))
         {
             return null;
         }
-        return (int.Parse(m.Groups[2].Value), int.Parse(m.Groups[1].Value) - 1);
+        return (codepoint, modValue - 1);
     }
 
     private static bool MatchesModifyOtherKeys(string data, int expectedKeycode, int expectedModifier)
@@ -878,15 +917,14 @@ public static partial class Keys
             return null;
         }
 
-        if (!int.TryParse(m.Groups[1].Value, out var codepoint))
+        if (!TryParseCsiParameter(m.Groups[1].Value, out var codepoint)
+            || !TryParseOptionalCsiParameter(m.Groups[2], null, out var shiftedKey)
+            || !TryParseOptionalCsiParameter(m.Groups[4], 1, out var modValue))
         {
             return null;
         }
 
-        var shiftedRaw = m.Groups[2].Value;
-        int? shiftedKey = m.Groups[2].Success && shiftedRaw.Length > 0 ? int.Parse(shiftedRaw) : null;
-        var modValue = m.Groups[4].Success ? int.Parse(m.Groups[4].Value) : 1;
-        var modifier = modValue - 1;
+        var modifier = modValue!.Value - 1;
 
         if ((modifier & ~KittyPrintableAllowedModifiers) != 0)
         {

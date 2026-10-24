@@ -4,7 +4,9 @@ namespace Pi.Tui.Marked;
 
 // Ported from marked v18.0.5 (packages/coding-agent/src/core/export-html/vendor/marked.min.js).
 // Regex sources and flags were captured from the live module, so they are byte-exact; only the JS
-// flags are mapped (g -> a Match loop, u -> implicit in .NET). Only the gfm rule sets are emitted:
+// flags are mapped (g -> a Match loop, u -> implicit in .NET), and JS `\d` is spelled `[0-9]` (T5:
+// .NET's `\d` is `\p{Nd}`, so "١." / "१." / "１." would otherwise start an ordered list and the
+// `int.Parse` of the bullet would throw). Only the gfm rule sets are emitted:
 // marked builds them as `{ ...normal, <gfm overrides> }`, so each one is already self-contained, and
 // components/markdown.ts runs marked with the default options (gfm: true, breaks: false).
 
@@ -25,9 +27,9 @@ public sealed class MarkedBlockRulesGfm
 
     public Regex Html { get; } = new(@"^ {0,3}(?:<(script|pre|style|textarea)[\s>][\s\S]*?(?:<\/\1>[^\n]*\n+|$)|<!--(?:-?>|[\s\S]*?(?:-->|$))[^\n]*(\n+|$)|<\?[\s\S]*?(?:\?>\n*|$)|<![A-Z][\s\S]*?(?:>\n*|$)|<!\[CDATA\[[\s\S]*?(?:\]\]>\n*|$)|<\/?(address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|meta|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)(?: +|\n|\/?>)[\s\S]*?(?:(?:\n[ 	]*)+\n|$)|<(?!script|pre|style|textarea)([a-z][\w-]*)(?: +[a-zA-Z:_][\w.:-]*(?: *= *""[^""\n]*""| *= *'[^'\n]*'| *= *[^\s""'=<>`]+)?)*? *\/?>(?=[ \t]*(?:\n|$))[\s\S]*?(?:(?:\n[ 	]*)+\n|$)|<\/(?!script|pre|style|textarea)[a-z][\w-]*\s*>(?=[ \t]*(?:\n|$))[\s\S]*?(?:(?:\n[ 	]*)+\n|$))", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
-    public Regex Lheading { get; } = new(@"^(?! {0,3}(?:[*+-]|\d{1,9}[.)]) |(?: {4}| {0,3}\t)| {0,3}(?:`{3,}|~{3,})| {0,3}>| {0,3}#{1,6}| {0,3}<[^\n>]+>\n| {0,3}\|?(?:[:\- ]*\|)+[\:\- ]*\n)((?:.|\n(?!\s*?\n| {0,3}(?:[*+-]|\d{1,9}[.)]) |(?: {4}| {0,3}\t)| {0,3}(?:`{3,}|~{3,})| {0,3}>| {0,3}#{1,6}| {0,3}<[^\n>]+>\n| {0,3}\|?(?:[:\- ]*\|)+[\:\- ]*\n))+?)\n {0,3}(=+|-+) *(?:\n+|$)", RegexOptions.Compiled);
+    public Regex Lheading { get; } = new(@"^(?! {0,3}(?:[*+-]|[0-9]{1,9}[.)]) |(?: {4}| {0,3}\t)| {0,3}(?:`{3,}|~{3,})| {0,3}>| {0,3}#{1,6}| {0,3}<[^\n>]+>\n| {0,3}\|?(?:[:\- ]*\|)+[\:\- ]*\n)((?:.|\n(?!\s*?\n| {0,3}(?:[*+-]|[0-9]{1,9}[.)]) |(?: {4}| {0,3}\t)| {0,3}(?:`{3,}|~{3,})| {0,3}>| {0,3}#{1,6}| {0,3}<[^\n>]+>\n| {0,3}\|?(?:[:\- ]*\|)+[\:\- ]*\n))+?)\n {0,3}(=+|-+) *(?:\n+|$)", RegexOptions.Compiled);
 
-    public Regex List { get; } = new(@"^( {0,3}(?:[*+-]|\d{1,9}[.)]))([ \t][^\n]*?)?(?:\n|$)", RegexOptions.Compiled);
+    public Regex List { get; } = new(@"^( {0,3}(?:[*+-]|[0-9]{1,9}[.)]))([ \t][^\n]*?)?(?:\n|$)", RegexOptions.Compiled);
 
     public Regex Newline { get; } = new(@"^(?:[ \t]*(?:\n|$))+", RegexOptions.Compiled);
 
@@ -163,9 +165,9 @@ public sealed class MarkedOtherRules
 
     public Regex EscapeReplace { get; } = new(@"[&<>""']", RegexOptions.Compiled);
 
-    public Regex EscapeTestNoEncode { get; } = new(@"[<>""']|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)", RegexOptions.Compiled);
+    public Regex EscapeTestNoEncode { get; } = new(@"[<>""']|&(?!(#[0-9]{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)", RegexOptions.Compiled);
 
-    public Regex EscapeReplaceNoEncode { get; } = new(@"[<>""']|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)", RegexOptions.Compiled);
+    public Regex EscapeReplaceNoEncode { get; } = new(@"[<>""']|&(?!(#[0-9]{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)", RegexOptions.Compiled);
 
     public Regex Caret { get; } = new(@"(^|[^\[])\^", RegexOptions.Compiled);
 
@@ -205,7 +207,7 @@ public sealed class MarkedOtherRules
     public Regex NextBulletRegex(int indent)
     {
         var slot = MemoSlot(indent);
-        return _nextBulletCache[slot] ??= new Regex($"^ {{0,{slot}}}(?:[*+-]|\\d{{1,9}}[.)])((?:[ \t][^\n]*)?(?:\n|$))");
+        return _nextBulletCache[slot] ??= new Regex($"^ {{0,{slot}}}(?:[*+-]|[0-9]{{1,9}}[.)])((?:[ \t][^\n]*)?(?:\n|$))");
     }
 
     public Regex HrRegex(int indent)

@@ -257,8 +257,14 @@ public sealed partial class StdinBuffer : IDisposable
             return null;
         }
 
-        var codepoint = int.Parse(match.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture);
-        return codepoint >= 32 ? codepoint : null;
+        // 捕获组无上界：溢出的码点不是可打印字符（JS parseInt 会得到一个巨大的数，同样走 null 分支）。
+        return int.TryParse(
+            match.Groups[1].Value,
+            System.Globalization.NumberStyles.None,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out var codepoint) && codepoint >= 32
+            ? codepoint
+            : null;
     }
 
     /// <summary>Split an accumulated buffer into complete sequences.</summary>

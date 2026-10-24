@@ -77,12 +77,17 @@ public sealed class ProcessTerminal : ITerminal
     private const string ProgressActive = "\x1b]9;4;3\x07";
     private const string ProgressClear = "\x1b]9;4;0\x07";
     private const int ProgressKeepAliveMs = 1000;
+    private const int ResizePollMs = 250;
 
     private Action<string>? _inputHandler;
     private Action? _resizeHandler;
     private CancellationTokenSource? _readCts;
     private Task? _readTask;
     private Timer? _progressTimer;
+    private PosixSignalRegistration? _resizeSignal;
+    private Timer? _resizePoll;
+    private int _lastColumns;
+    private int _lastRows;
     private bool _started;
     private bool _rawModeSet;
 
@@ -143,25 +148,126 @@ public sealed class ProcessTerminal : ITerminal
 
         _readCts = new CancellationTokenSource();
         _readTask = Task.Run(() => ReadLoop(_readCts.Token));
+        StartResizeWatch();
+    }
+
+    /// <summary>
+    /// 对应 TS 的 <c>process.stdout.on("resize", …)</c>。Node 由 SIGWINCH 驱动该事件；.NET 没有现成的
+    /// 尺寸变化通知：Unix 上用 <see cref="PosixSignalRegistration"/> 订阅 SIGWINCH，Windows 没有该信号
+    /// （控制台也不会推送尺寸变化），改为每 <see cref="ResizePollMs"/> 毫秒轮询
+    /// <see cref="Console.WindowWidth"/> / <see cref="Console.WindowHeight"/>，变化时调用 resize 回调。
+    /// 没有真实控制台（输出被重定向，如测试运行器）时不轮询。
+    /// </summary>
+    private void StartResizeWatch()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            try
+            {
+                _resizeSignal = PosixSignalRegistration.Create(PosixSignal.SIGWINCH, _ => _resizeHandler?.Invoke());
+                return;
+            }
+            catch (PlatformNotSupportedException)
+            {
+                // 退回轮询。
+            }
+            catch (IOException)
+            {
+                // 退回轮询。
+            }
+        }
+
+        bool redirected;
+        try
+        {
+            redirected = Console.IsOutputRedirected;
+        }
+        catch
+        {
+            redirected = true;
+        }
+        if (redirected)
+        {
+            return;
+        }
+
+        _lastColumns = Columns;
+        _lastRows = Rows;
+        _resizePoll = new Timer(_ => PollResize(), null, ResizePollMs, ResizePollMs);
+    }
+
+    private void PollResize()
+    {
+        if (!_started)
+        {
+            return;
+        }
+
+        int columns;
+        int rows;
+        try
+        {
+            columns = Console.WindowWidth;
+            rows = Console.WindowHeight;
+        }
+        catch
+        {
+            // 控制台句柄暂时不可用（例如被分离）；下一次轮询再试。计时器线程上绝不能抛出。
+            return;
+        }
+
+        if (columns <= 0 || rows <= 0 || (columns == _lastColumns && rows == _lastRows))
+        {
+            return;
+        }
+
+        _lastColumns = columns;
+        _lastRows = rows;
+        _resizeHandler?.Invoke();
+    }
+
+    private void StopResizeWatch()
+    {
+        _resizeSignal?.Dispose();
+        _resizeSignal = null;
+        _resizePoll?.Dispose();
+        _resizePoll = null;
     }
 
     private void ReadLoop(CancellationToken token)
     {
+        bool redirected;
+        try
+        {
+            redirected = Console.IsInputRedirected;
+        }
+        catch (IOException)
+        {
+            return;
+        }
+
+        if (redirected)
+        {
+            try
+            {
+                PumpRedirectedInput(Console.In, data => _inputHandler?.Invoke(data), token);
+            }
+            catch (InvalidOperationException)
+            {
+                // stdin 已关闭。
+            }
+            catch (IOException)
+            {
+                // stdin 已关闭。
+            }
+            return;
+        }
+
         while (!token.IsCancellationRequested)
         {
             ConsoleKeyInfo keyInfo;
             try
             {
-                if (Console.IsInputRedirected)
-                {
-                    var read = Console.In.Read();
-                    if (read < 0)
-                    {
-                        break;
-                    }
-                    _inputHandler?.Invoke(char.ConvertFromUtf32(read));
-                    continue;
-                }
                 keyInfo = Console.ReadKey(intercept: true);
             }
             catch (InvalidOperationException)
@@ -183,6 +289,26 @@ public sealed class ProcessTerminal : ITerminal
             {
                 _inputHandler?.Invoke(sequence);
             }
+        }
+    }
+
+    /// <summary>
+    /// 重定向 stdin 的读取循环。<see cref="TextReader.Read()"/> 返回的是 UTF-16 <b>码元</b>而不是码点：
+    /// 一个 emoji 会分两次（高、低代理）到达。原先对每个码元调 <c>char.ConvertFromUtf32</c>，遇到任一半
+    /// 都会抛 <see cref="ArgumentOutOfRangeException"/>，读取任务静默出错、输入从此失灵。现在把码元原样
+    /// 转发，由下游（编辑器把两半拼回同一个字符串）重组——Node 的 <c>data</c> 事件同样可能把一个字符
+    /// 切在两个 chunk 里。
+    /// </summary>
+    internal static void PumpRedirectedInput(TextReader reader, Action<string> onInput, CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
+        {
+            var read = reader.Read();
+            if (read < 0)
+            {
+                break;
+            }
+            onInput(((char)read).ToString());
         }
     }
 
@@ -350,6 +476,7 @@ public sealed class ProcessTerminal : ITerminal
             // ignore
         }
 
+        StopResizeWatch();
         RestoreRawMode();
         _inputHandler = null;
         _resizeHandler = null;
@@ -550,6 +677,9 @@ public sealed class ProcessTerminal : ITerminal
 /// </summary>
 public sealed class StringTerminal : ITerminal
 {
+    // 渲染线程写帧的同时，ShowOverlay / Hide 会从调用方线程写 HideCursor：StringBuilder 不是线程安全的
+    // （并发 Append 会抛 "Destination is too short"），而真实终端的 Console.Out 是同步的，这里也要同步。
+    private readonly Lock _outputGate = new();
     private readonly StringBuilder _output = new();
     private Action<string>? _inputHandler;
 
@@ -567,9 +697,24 @@ public sealed class StringTerminal : ITerminal
 
     public bool Started { get; private set; }
 
-    public string Output => _output.ToString();
+    public string Output
+    {
+        get
+        {
+            lock (_outputGate)
+            {
+                return _output.ToString();
+            }
+        }
+    }
 
-    public void ClearOutput() => _output.Clear();
+    public void ClearOutput()
+    {
+        lock (_outputGate)
+        {
+            _output.Clear();
+        }
+    }
 
     public void Start(Action<string> onInput, Action onResize)
     {
@@ -585,7 +730,13 @@ public sealed class StringTerminal : ITerminal
         return Task.CompletedTask;
     }
 
-    public void Write(string data) => _output.Append(data);
+    public void Write(string data)
+    {
+        lock (_outputGate)
+        {
+            _output.Append(data);
+        }
+    }
 
     /// <summary>Simulate terminal input arriving.</summary>
     public void SendInput(string data) => _inputHandler?.Invoke(data);

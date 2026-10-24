@@ -1,4 +1,5 @@
-﻿using System.Text.RegularExpressions;
+﻿using System.Globalization;
+using System.Text.RegularExpressions;
 
 namespace Pi.Tui.Marked;
 
@@ -232,12 +233,15 @@ public sealed class MarkedTokenizer
                 break;
             }
 
+            // The three merges below are `substring` calls in marked, and the lengths they subtract can
+            // exceed the string (a nested token's raw may already carry the extra "\n" described next),
+            // so they must clamp like JS instead of throwing.
             if (last?.Type == "blockquote")
             {
                 var merged = Blockquote(last.Raw + "\n" + string.Join('\n', lines))!;
                 tokens[^1] = merged;
-                raw = raw[..(raw.Length - last.Raw.Length)] + merged.Raw;
-                text = text[..(text.Length - last.Text!.Length)] + merged.Text!;
+                raw = JsString.Substring(raw, 0, raw.Length - last.Raw.Length) + merged.Raw;
+                text = JsString.Substring(text, 0, text.Length - last.Text!.Length) + merged.Text!;
                 break;
             }
 
@@ -246,9 +250,13 @@ public sealed class MarkedTokenizer
                 var remaining = last.Raw + "\n" + string.Join('\n', lines);
                 var merged = List(remaining)!;
                 tokens[^1] = merged;
-                raw = raw[..(raw.Length - last.Raw.Length)] + merged.Raw;
-                text = text[..(text.Length - last.Raw.Length)] + merged.Raw;
-                lines = remaining[merged.Raw.Length..].Split('\n').ToList();
+                raw = JsString.Substring(raw, 0, raw.Length - last.Raw.Length) + merged.Raw;
+                text = JsString.Substring(text, 0, text.Length - last.Raw.Length) + merged.Raw;
+                // When the list consumed everything, `"".split('\n')` is `[""]` in JS, so the loop runs once
+                // more and appends a trailing "\n" to `raw` — one character more than the source. That is
+                // marked's behaviour too (its lexer's `substring` clamps the overshoot), so it is kept
+                // here for token parity; the lexer clamps the same way via JsString.Substring.
+                lines = JsString.Substring(remaining, merged.Raw.Length).Split('\n').ToList();
                 continue;
             }
         }
@@ -266,21 +274,26 @@ public sealed class MarkedTokenizer
 
         var bullet = JsString.Trim(match.Groups[1].Value);
         var ordered = bullet.Length > 1;
+        // The rule's `[0-9]{1,9}` (T5) guarantees ASCII digits here, but parse defensively anyway: a
+        // FormatException on a render thread would take the process down.
         var list = new MarkedToken
         {
             Type = "list",
             Raw = "",
             Ordered = ordered,
-            Start = ordered ? int.Parse(bullet[..^1]) : null,
+            Start = ordered && int.TryParse(bullet[..^1], NumberStyles.None, CultureInfo.InvariantCulture, out var start)
+                ? start
+                : null,
             Loose = false,
             Items = [],
         };
 
         // marked builds the item pattern as `\d{1,9}\<last char of the bullet>` for ordered lists
-        // and `\<bullet>` otherwise. Written as concatenation on purpose: inside an interpolated
-        // string `\$` does not start a hole, so `$"\\d{1,9}\\${bullet[^1]}"` would emit a stray '$'.
+        // and `\<bullet>` otherwise (JS `\d` is `[0-9]` here, see T5). Written as concatenation on
+        // purpose: inside an interpolated string `\$` does not start a hole, so
+        // `$"[0-9]{1,9}\\${bullet[^1]}"` would emit a stray '$'.
         var bulletPattern = ordered
-            ? "\\d{1,9}\\" + bullet[^1]
+            ? "[0-9]{1,9}\\" + bullet[^1]
             : "\\" + bullet;
         if (Options.Pedantic)
         {
