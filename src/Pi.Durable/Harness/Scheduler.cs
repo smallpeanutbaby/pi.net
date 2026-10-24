@@ -178,20 +178,37 @@ public sealed class TaskScheduler
     /// </summary>
     private readonly object _sleepTimerGate = new();
 
-    /// <summary>上一次交给 <c>onWake</c> 的值，未变化时不重复。</summary>
+    /// <summary>上一次交给 <c>onWake</c> 的值，未变化时不重复。只由 <see cref="DeliverWakes"/> 读写。</summary>
     private Wake? _lastWake;
 
-    private bool _wakeScheduled;
+    /// <summary>
+    /// 保护 <see cref="_wakeDirty"/> 与 <see cref="_wakeRunning"/>。上游 <c>#scheduleWake</c> 的函数体在一个
+    /// 微任务里一次跑完；端口把它丢上线程池，两个函数体可能交错，先算出的旧唤醒反而后送达。这里让同一时刻
+    /// 只有一个投递循环在跑，循环期间到达的 kick 置脏位、并入下一轮，于是送达顺序就是计算顺序。
+    /// </summary>
+    private readonly object _wakeGate = new();
+    private bool _wakeDirty;
+    private bool _wakeRunning;
 
-    private bool _reconcileScheduled;
+    // 这些标志在线上、线程池与宿主线程之间传递；volatile 排除 check-then-act 之外的重排序问题。
+    private volatile bool _reconcileScheduled;
     private bool _cascadePending;
     private IDisposable _unsubscribeRegistry = new NopDisposable();
-    private bool _enabled;
-    private bool _closing;
-    private bool _dirty;
-    private bool _draining;
+    private volatile bool _enabled;
+    private volatile bool _closing;
+    private volatile bool _dirty;
+    private volatile bool _draining;
 
-    /// <summary>封印（close 开始）时取消的调用快照；关闭要把它们跑过的任务写回 <c>pending</c>。</summary>
+    /// <summary>
+    /// 保护 <see cref="_invocations"/> 与 <see cref="_sealed"/>：调用在线上登记，却在线程池线程上结束
+    /// （<see cref="Start"/> 的 finally），封印又在 close 调用方线程上快照。上游单线程无此约束。
+    /// </summary>
+    private readonly object _invocationsGate = new();
+
+    /// <summary>
+    /// 封印（close 开始）时取消的调用快照；关闭要把它们跑过的任务写回 <c>pending</c>。封印之后仍在线上
+    /// 登记的调用（封印落在其保留提交中途）由 <see cref="CreateInvocation"/> 并入。
+    /// </summary>
     private List<Invocation>? _sealed;
 
     public TaskScheduler(TaskSchedulerOptions options)
@@ -326,7 +343,11 @@ public sealed class TaskScheduler
 
     private bool ComputeActive()
     {
-        if (_invocations.Count > 0) return true;
+        lock (_invocationsGate)
+        {
+            if (_invocations.Count > 0) return true;
+        }
+
         IRegistrySnapshot? snapshot = null;
         var snapshotFailed = false;
         foreach (var record in _live.Values)
@@ -388,41 +409,72 @@ public sealed class TaskScheduler
     public async Task JoinAsync()
     {
         // 封印时已取消的调用快照：Cancel 之后它们的阶段可能立刻结束并从 _invocations 消失，
-        // 但关闭仍须把其跑过的任务写回 pending。对应 TS seal 与 join 在同一同步块内完成。
-        var stopped = _sealed ?? _invocations.Values.ToList();
-        foreach (var invocation in stopped) invocation.Controller.Cancel();
-        if (stopped.Count == 0) return;
-        try
+        // 但关闭仍须把其跑过的任务写回 pending。对应 TS seal 与 join 在同一同步块内完成；端口里
+        // Session.close 先同步运行封印、再把本方法丢上线程池，所以这里看到的 _sealed 已经就位。
+        // 保留提交可能恰好横跨封印：它在线上登记的调用会被并入 _sealed，所以每轮都重新取尚未 join 的那些，
+        // 并在写回（同样在线上）之前再查最后一次——有新的就再等一轮，没有才写。
+        var stopped = new HashSet<Invocation>();
+        while (true)
         {
-            await Task.WhenAll(stopped.Select(invocation => invocation.Done)).ConfigureAwait(false);
-        }
-        catch
-        {
-            // Promise.allSettled：吞掉所有结局。
-        }
-
-        try
-        {
-            await _writeAtClose(() =>
+            var batch = Unjoined(stopped);
+            if (batch.Count > 0)
             {
-                var writes = new List<StorageWrite>();
-                foreach (var invocation in stopped)
+                foreach (var invocation in batch) invocation.Controller.Cancel();
+                try
                 {
-                    var record = _live.GetValueOrDefault(invocation.TaskId);
-                    if (record is null || record.State.Status != TaskStatus.Running) continue;
-                    writes.Add(new StorageWrite.Task(WithState(record, new TaskState
-                    {
-                        Status = TaskStatus.Pending,
-                        Checkpoint = record.State.Checkpoint,
-                    })));
+                    await Task.WhenAll(batch.Select(invocation => invocation.Done)).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Promise.allSettled：吞掉所有结局。
                 }
 
-                return writes;
-            }).ConfigureAwait(false);
+                stopped.UnionWith(batch);
+                continue;
+            }
+
+            var late = false;
+            try
+            {
+                await _writeAtClose(() =>
+                {
+                    if (Unjoined(stopped).Count > 0)
+                    {
+                        late = true;
+                        return [];
+                    }
+
+                    var writes = new List<StorageWrite>();
+                    foreach (var invocation in stopped)
+                    {
+                        var record = _live.GetValueOrDefault(invocation.TaskId);
+                        if (record is null || record.State.Status != TaskStatus.Running) continue;
+                        writes.Add(new StorageWrite.Task(WithState(record, new TaskState
+                        {
+                            Status = TaskStatus.Pending,
+                            Checkpoint = record.State.Checkpoint,
+                        })));
+                    }
+
+                    return writes;
+                }).ConfigureAwait(false);
+            }
+            catch
+            {
+                // 写回失败时记录留在 running，按被切断计；Storage 守卫会使 Session 失败并上报。
+            }
+
+            if (!late) return;
         }
-        catch
+    }
+
+    /// <summary>封印快照（未封印时为当前调用表）里尚未 join 的调用。</summary>
+    private List<Invocation> Unjoined(HashSet<Invocation> stopped)
+    {
+        lock (_invocationsGate)
         {
-            // 写回失败时记录留在 running，按被切断计；Storage 守卫会使 Session 失败并上报。
+            IEnumerable<Invocation> candidates = _sealed is { } sealedNow ? sealedNow : _invocations.Values;
+            return candidates.Where(invocation => !stopped.Contains(invocation)).ToList();
         }
     }
 
@@ -440,7 +492,8 @@ public sealed class TaskScheduler
             var current = await tx.GetTaskAsync(id).ConfigureAwait(false);
             if (current is null) throw new InvalidOperationException($"Task {id.Value} does not exist");
             if (current.State.Status == TaskStatus.Terminal) return ("terminal", (Invocation?)null);
-            var invocation = _invocations.GetValueOrDefault(id);
+            Invocation? invocation;
+            lock (_invocationsGate) invocation = _invocations.GetValueOrDefault(id);
             // 带 restart 标记的任务没有 run 调用；它只等自己的 abort。
             if (keepRestart && current.AbortReason == RestartReason) return ("marked", (Invocation?)null);
             if (invocation is null && current.State.Status != TaskStatus.Completing)
@@ -505,12 +558,19 @@ public sealed class TaskScheduler
     /// <summary>
     /// 当从该对话、或从每个无主对话出发的普通遍历不再触达存活的非后台任务时完成。
     /// </summary>
-    public Task WaitForIdleAsync(ConversationId? conversationId, Context context)
+    public async Task WaitForIdleAsync(ConversationId? conversationId, Context context)
     {
-        if (_closing) return Task.FromException(HarnessUtil.ClosedError());
-        if (Idle(conversationId)) return Task.CompletedTask;
-        ScheduleReconcile();
-        return _idleWaiters.Add(new IdleKey(conversationId), context);
+        if (_closing) throw HarnessUtil.ClosedError();
+        // 空闲判定枚举 _live，只能在线上做（上游单线程无此约束；端口里调用方线程与提交并发会撞上
+        // 「集合已修改」）；等待者的登记放在同一段里，使终态发布不落在判定与登记之间。
+        var waiter = await _session.ReadOnLineAsync<Task>(() =>
+        {
+            if (_closing) throw HarnessUtil.ClosedError();
+            if (Idle(conversationId)) return Task.FromResult(Task.CompletedTask);
+            ScheduleReconcile();
+            return Task.FromResult<Task>(_idleWaiters.Add(new IdleKey(conversationId), context));
+        }).ConfigureAwait(false);
+        await waiter.ConfigureAwait(false);
     }
 
     /// <summary>
@@ -581,10 +641,9 @@ public sealed class TaskScheduler
             {
                 _cascadePending = true;
                 // 给新标记任务的 run 调用发信号；其下一个 step 结束它。
-                if (_invocations.GetValueOrDefault(record.Id) is { Mode: "run" } invocation)
-                {
-                    invocation.Controller.Cancel();
-                }
+                Invocation? invocation;
+                lock (_invocationsGate) invocation = _invocations.GetValueOrDefault(record.Id);
+                if (invocation is { Mode: "run" }) invocation.Controller.Cancel();
             }
 
             var status = record.State.Status;
@@ -797,16 +856,21 @@ public sealed class TaskScheduler
     /// </summary>
     private async Task ReconcileAsync()
     {
-        _reconcileScheduled = false;
-        var cascade = _cascadePending;
-        _cascadePending = false;
-        var checks = _failFastChecks.ToList();
-        _failFastChecks.Clear();
+        // 快照与清空在线上做，与 Observe 串行：其间落下的 _cascadePending / _failFastChecks 不会丢
+        // （上游在同一事件循环里天然如此；端口的 Task.Run 线程不在线上）。
+        var ran = false;
+        List<TaskId<object?>> checks = [];
         try
         {
             await _session.CommitWithAsync<object?>(async tx =>
             {
+                ran = true;
+                _reconcileScheduled = false;
                 if (_closing) return null;
+                var cascade = _cascadePending;
+                _cascadePending = false;
+                checks = _failFastChecks.ToList();
+                _failFastChecks.Clear();
                 var queued = await LoadScopesAsync(cascade).ConfigureAwait(false);
                 var marked = new HashSet<TaskId<object?>>();
                 void Mark(TaskRecord record)
@@ -847,18 +911,36 @@ public sealed class TaskScheduler
                 }
 
                 await FinalizeAsync(tx).ConfigureAwait(false);
+                // 加载边可能让某些等待者的空闲判定变为可知。判定枚举 _live，留在线上；TS 在提交落定后
+                // 才解析，这里提前到提交回调末尾——判定只看已提交状态，本次暂存的标记与终态不会让范围
+                // 变得「更不空闲」，随后的发布仍会再解析一次。
+                ResolveIdleWaiters();
                 return null;
             }, _context).ConfigureAwait(false);
         }
         catch (Exception error)
         {
-            // 任何一遍都可能暂存了标记，因此失败的一遍随下一次提交重试。
-            _cascadePending = true;
-            foreach (var id in checks) _failFastChecks.Add(id);
             if (!_closing) _report(error, ListenerFailure);
+            // 任何一遍都可能暂存了标记，因此失败的一遍随下一次提交重试；恢复同样在线上做。
+            var restore = checks;
+            var reschedule = !ran;
+            try
+            {
+                await _session.ReadOnLineAsync(() =>
+                {
+                    _cascadePending = true;
+                    foreach (var id in restore) _failFastChecks.Add(id);
+                    // 提交回调没跑到（受理被拒）就没人清过标志；清掉它，让下一次观察还能排期。
+                    if (reschedule) _reconcileScheduled = false;
+                    ResolveIdleWaiters();
+                    return Task.FromResult<object?>(null);
+                }).ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                // Session 已关闭或失败：没有下一次提交可以重试。
+            }
         }
-
-        ResolveIdleWaiters();
     }
 
     /// <summary><paramref name="ids"/> 中是否有任务持有或以非 <c>completed</c> 的结局结束。</summary>
@@ -1131,8 +1213,9 @@ public sealed class TaskScheduler
         var error = HarnessUtil.ClosedError();
         _taskWaiters.RejectAll(error);
         _idleWaiters.RejectAll(error);
-        _sealed = [.. _invocations.Values];
-        foreach (var invocation in _sealed) invocation.Controller.Cancel();
+        List<Invocation> sealedNow;
+        lock (_invocationsGate) _sealed = sealedNow = [.. _invocations.Values];
+        foreach (var invocation in sealedNow) invocation.Controller.Cancel();
     }
 
     private void Kick()
@@ -1170,44 +1253,73 @@ public sealed class TaskScheduler
     /// <summary>在线外重算唤醒：布设内建定时器，或把变化告知 <c>onWake</c>。对应 TS <c>#scheduleWake</c>。</summary>
     private void ScheduleWake()
     {
-        if (_wakeScheduled || _closing) return;
-        _wakeScheduled = true;
-        _ = Task.Run(() =>
+        if (_closing) return;
+        lock (_wakeGate)
         {
-            _wakeScheduled = false;
-            if (_closing) return;
-            Wake wake;
-            try
+            _wakeDirty = true;
+            if (_wakeRunning) return;
+            _wakeRunning = true;
+        }
+
+        _ = Task.Run(DeliverWakes);
+    }
+
+    /// <summary>
+    /// 唤醒投递循环：同一时刻只有一个在跑；每轮先清脏位再计算并送达，循环期间的 kick 重新置脏，于是
+    /// 旧状态算出的唤醒绝不会压在新状态之后送达，<see cref="_lastWake"/> 也只有这一个写者。
+    /// </summary>
+    private void DeliverWakes()
+    {
+        while (true)
+        {
+            lock (_wakeGate)
             {
-                wake = Wake();
-            }
-            catch (Exception error)
-            {
-                if (!_closing) _report(error, OnWakeError);
-                // 失败也要保住定时器，否则睡眠任务再没人唤醒。
-                ArmSleepTimer(_enabled ? EarliestSleep() : null);
-                return;
+                if (!_wakeDirty || _closing)
+                {
+                    _wakeRunning = false;
+                    return;
+                }
+
+                _wakeDirty = false;
             }
 
-            if (_onWake is null)
-            {
-                ArmSleepTimer(_enabled ? EarliestSleep() : null);
-                return;
-            }
+            DeliverWake();
+        }
+    }
 
-            var last = _lastWake;
-            if (last is not null && last.Active == wake.Active && last.At == wake.At) return;
-            try
-            {
-                _onWake(wake);
-                // 只有送达的唤醒才记账：抛出之后，下一次变化或 kick 会再给一次。
-                _lastWake = wake;
-            }
-            catch (Exception error)
-            {
-                _report(error, OnWakeError);
-            }
-        });
+    private void DeliverWake()
+    {
+        Wake wake;
+        try
+        {
+            wake = Wake();
+        }
+        catch (Exception error)
+        {
+            if (!_closing) _report(error, OnWakeError);
+            // 失败也要保住定时器，否则睡眠任务再没人唤醒。
+            ArmSleepTimer(_enabled ? EarliestSleep() : null);
+            return;
+        }
+
+        if (_onWake is null)
+        {
+            ArmSleepTimer(_enabled ? EarliestSleep() : null);
+            return;
+        }
+
+        var last = _lastWake;
+        if (last is not null && last.Active == wake.Active && last.At == wake.At) return;
+        try
+        {
+            _onWake(wake);
+            // 只有送达的唤醒才记账：抛出之后，下一次变化或 kick 会再给一次。
+            _lastWake = wake;
+        }
+        catch (Exception error)
+        {
+            _report(error, OnWakeError);
+        }
     }
 
     /// <summary>
@@ -1374,7 +1486,7 @@ public sealed class TaskScheduler
                 IRegistrySnapshot? snapshot = null;
                 foreach (var record in _live.Values.ToList())
                 {
-                    if (_invocations.ContainsKey(record.Id) || WaitingOn(record, owned).Count > 0) continue;
+                    if (HasInvocation(record.Id) || WaitingOn(record, owned).Count > 0) continue;
                     if (record.State.Status == TaskStatus.Completing) continue;
                     // 到点才回到候选：由睡眠定时器或 Resume() 的 WakeDue() 重新发起一遍。
                     if (NotDue(record)) continue;
@@ -1435,12 +1547,12 @@ public sealed class TaskScheduler
         }
         catch
         {
-            foreach (var reservation in reservations)
+            lock (_invocationsGate)
             {
-                _invocations.Remove(reservation.Invocation.TaskId);
-                reservation.Invocation.Finish();
+                foreach (var reservation in reservations) _invocations.Remove(reservation.Invocation.TaskId);
             }
 
+            foreach (var reservation in reservations) reservation.Invocation.Finish();
             throw;
         }
 
@@ -1536,7 +1648,7 @@ public sealed class TaskScheduler
         IRegistrySnapshot snapshot,
         IReadOnlyDictionary<TaskId<object?>, List<TaskId<object?>>> owned)
     {
-        if (_invocations.ContainsKey(record.Id)) return new TaskInspection.Running { Record = record };
+        if (HasInvocation(record.Id)) return new TaskInspection.Running { Record = record };
         if (record.State.Status == TaskStatus.Completing)
         {
             return new TaskInspection.Completing { Record = record };
@@ -1578,8 +1690,25 @@ public sealed class TaskScheduler
             Done = completion.Task,
             Finish = () => completion.TrySetResult(null),
         };
-        _invocations[record.Id] = invocation;
+        var sealedLate = false;
+        lock (_invocationsGate)
+        {
+            _invocations[record.Id] = invocation;
+            // 封印落在本次保留提交中途：并入快照，让 join 等到它并把它跑过的任务写回。
+            if (_closing && _sealed is { } sealedNow)
+            {
+                sealedNow.Add(invocation);
+                sealedLate = true;
+            }
+        }
+
+        if (sealedLate) controller.Cancel();
         return invocation;
+    }
+
+    private bool HasInvocation(TaskId<object?> id)
+    {
+        lock (_invocationsGate) return _invocations.ContainsKey(id);
     }
 
     private void Start(Reservation reservation)
@@ -1935,16 +2064,34 @@ public sealed class TaskScheduler
     /// </summary>
     private void End(Invocation invocation)
     {
-        if (invocation.Ended) return;
-        invocation.Ended = true;
-        if (ReferenceEquals(_invocations.GetValueOrDefault(invocation.TaskId), invocation))
+        // 既可能在线上（step）也可能在线程池上（Start 的 finally）被调用：结束标记与登记表的摘除同锁。
+        lock (_invocationsGate)
         {
-            _invocations.Remove(invocation.TaskId);
+            if (invocation.Ended) return;
+            invocation.Ended = true;
+            if (ReferenceEquals(_invocations.GetValueOrDefault(invocation.TaskId), invocation))
+            {
+                _invocations.Remove(invocation.TaskId);
+            }
         }
 
-        foreach (var watch in invocation.Watches) _ = watch.Stop();
-        foreach (var disarm in invocation.Timers.ToArray()) disarm();
-        invocation.Timers.Clear();
+        // watch 与定时器集合由定时器回调 / watch 关闭在任意线程上修改：先在各自的锁下取走，再在锁外处理。
+        Watch[] watches;
+        lock (invocation.Watches)
+        {
+            watches = [.. invocation.Watches];
+            invocation.Watches.Clear();
+        }
+
+        foreach (var watch in watches) _ = watch.Stop();
+        Action[] timers;
+        lock (invocation.Timers)
+        {
+            timers = [.. invocation.Timers];
+            invocation.Timers.Clear();
+        }
+
+        foreach (var disarm in timers) disarm();
         // 绑定到该调用的挂起等待（如工具的 waitForTask）随其拒绝。
         invocation.Controller.Cancel();
     }
@@ -2228,13 +2375,17 @@ public sealed class TaskScheduler
             Action? disarm = null;
             disarm = scheduler._timers.Foreground(() =>
             {
-                if (disarm is not null) invocation.Timers.Remove(disarm);
+                if (disarm is not null)
+                {
+                    lock (invocation.Timers) invocation.Timers.Remove(disarm);
+                }
+
                 if (!invocation.Ended) callback();
             }, delayMs);
-            invocation.Timers.Add(disarm);
+            lock (invocation.Timers) invocation.Timers.Add(disarm);
             return () =>
             {
-                invocation.Timers.Remove(disarm);
+                lock (invocation.Timers) invocation.Timers.Remove(disarm);
                 disarm();
             };
         }
@@ -2296,9 +2447,20 @@ public sealed class TaskScheduler
                 throw EndedError(invocation);
             }
 
-            invocation.Watches.Add(watch);
+            lock (invocation.Watches) invocation.Watches.Add(watch);
             _ = watch.Closed.ContinueWith(
-                _ => invocation.Watches.Remove(watch), BclTaskScheduler.Default);
+                _ =>
+                {
+                    lock (invocation.Watches) invocation.Watches.Remove(watch);
+                },
+                BclTaskScheduler.Default);
+            if (invocation.Ended)
+            {
+                // End 恰在登记之前清空了集合：这里补上停止。
+                _ = watch.Stop();
+                throw EndedError(invocation);
+            }
+
             return watch;
         }
 

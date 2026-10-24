@@ -28,6 +28,12 @@ public class DurableSession : ISession
 {
     private readonly IStorage _storage;
     private readonly Dictionary<string, LoadedDocument> _documents = [];
+
+    /// <summary>
+    /// 保护两个监听器集合：订阅与退订（watch 的 detach）在任意线程上发生，而发布与 close 在线上或
+    /// 调用方线程上枚举它们。上游单线程无此问题。
+    /// </summary>
+    private readonly object _listenersGate = new();
     private readonly HashSet<Action<CommitPublication, Context>> _commitListeners = [];
     private readonly HashSet<Action> _closeListeners = [];
     private readonly ITransactionHost _host;
@@ -323,19 +329,40 @@ public class DurableSession : ISession
         if (_closing is null)
         {
             var cleanup = ContextSignals.WithoutAbortSignal(context);
-            // 先封闭受理，再停止观察者；已受理工作在 Storage 关闭之前结算。
-            _closing = Task.Run(() => OnBeforeCloseAsync())
+            // 先封闭受理（_closing 非空即拒绝新作业），再同步通知关闭监听器（Harness 的调度器在这里封印：
+            // 置 closing、取消并快照调用），然后才开始 beforeClose（调度器 join 已封印的调用并写回）。
+            // TS 里 beforeClose 的同步前缀与监听器在同一同步块内完成；端口把 beforeClose 丢上线程池，
+            // 所以必须先让监听器跑完，否则 join 可能在封印之前快照，漏掉其间保留的调用。
+            // 已受理工作在 Storage 关闭之前结算。
+            var closing = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _closing = closing.Task;
+            Action[] listeners;
+            lock (_listenersGate)
+            {
+                listeners = _closeListeners.ToArray();
+                _closeListeners.Clear();
+            }
+
+            foreach (var listener in listeners) listener();
+            _ = Task.Run(() => OnBeforeCloseAsync())
                 .ContinueWith(_ => Enqueue<object?>(async () =>
                 {
-                    _commitListeners.Clear();
+                    lock (_listenersGate) _commitListeners.Clear();
                     _documents.Clear();
                     await _storage.CloseAsync().ConfigureAwait(false);
                     return null;
                 }), CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default)
-                .Unwrap();
-            var listeners = _closeListeners.ToArray();
-            _closeListeners.Clear();
-            foreach (var listener in listeners) listener();
+                .Unwrap()
+                .ContinueWith(
+                    task =>
+                    {
+                        if (task.IsFaulted) closing.TrySetException(task.Exception!.InnerExceptions);
+                        else if (task.IsCanceled) closing.TrySetCanceled();
+                        else closing.TrySetResult(null);
+                    },
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
         }
         return ContextSignals.AwaitWithContext(_closing, context);
     }
@@ -387,16 +414,22 @@ public class DurableSession : ISession
     public IDisposable SubscribeCommits(Action<CommitPublication, Context> listener)
     {
         AssertUsable();
-        _commitListeners.Add(listener);
-        return new Unsubscription(() => _commitListeners.Remove(listener));
+        lock (_listenersGate) _commitListeners.Add(listener);
+        return new Unsubscription(() =>
+        {
+            lock (_listenersGate) _commitListeners.Remove(listener);
+        });
     }
 
     /// <summary>注册在 close 开始时同步调用的监听器。不得抛出、阻塞或调用 Session 操作。</summary>
     public IDisposable SubscribeClose(Action listener)
     {
         AssertUsable();
-        _closeListeners.Add(listener);
-        return new Unsubscription(() => _closeListeners.Remove(listener));
+        lock (_listenersGate) _closeListeners.Add(listener);
+        return new Unsubscription(() =>
+        {
+            lock (_listenersGate) _closeListeners.Remove(listener);
+        });
     }
 
     /// <summary>在变更线上丢弃每个已加载跟踪器；之后的访问从 Storage 冷加载。</summary>
@@ -497,7 +530,9 @@ public class DurableSession : ISession
         IReadOnlyList<DocumentCommitChange> documents,
         Context context)
     {
-        if (_commitListeners.Count == 0) return;
+        Action<CommitPublication, Context>[] listeners;
+        lock (_listenersGate) listeners = _commitListeners.ToArray();
+        if (listeners.Length == 0) return;
         var changes = new List<CommitChange>();
         foreach (var write in writes)
         {
@@ -528,7 +563,7 @@ public class DurableSession : ISession
         }
         var publication = new CommitPublication { Seq = seq, Changes = changes };
         // 提交已持久化：一个监听器抛出既不让提交失败，也不跳过其余监听器。对应 TS <c>publish</c>。
-        foreach (var listener in _commitListeners.ToArray())
+        foreach (var listener in listeners)
         {
             try
             {

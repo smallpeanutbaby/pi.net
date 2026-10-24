@@ -109,11 +109,15 @@ public sealed class ConversationViews
         });
         _session.SubscribeClose(() =>
         {
-            List<object[]> observers;
+            List<object[]> observers = [];
             lock (_gate)
             {
                 _closed = true;
-                observers = [.. _mounts.Values.Select(mount => mount.Observers.ToArray())];
+                foreach (var mount in _mounts.Values)
+                {
+                    lock (mount.Observers) observers.Add([.. mount.Observers]);
+                }
+
                 _mounts.Clear();
             }
 
@@ -183,10 +187,11 @@ public sealed class ConversationViews
             }
 
             context.AbortSignal?.ThrowIfCancellationRequested();
+            // 观察者集合始终以自身为锁（detach 在任意线程上、不持 _gate 地移除）；_gate 嵌套在外，顺序固定。
             lock (_gate)
             {
                 _mounts[id] = mount;
-                mount.Observers.Add(observer);
+                lock (mount.Observers) mount.Observers.Add(observer);
             }
 
             return (observer, detach);
@@ -198,11 +203,15 @@ public sealed class ConversationViews
         T? observer = default;
         Action detach = () =>
         {
+            // RemoveIfCurrent 要拿 _gate；在 Observers 锁外调用，避免与 attach 的 _gate → Observers 顺序相反。
+            bool empty;
             lock (mount.Observers)
             {
                 mount.Observers.Remove(observer!);
-                if (mount.Observers.Count == 0) RemoveIfCurrent(mount);
+                empty = mount.Observers.Count == 0;
             }
+
+            if (empty) RemoveIfCurrent(mount);
         };
         observer = create(mount.Value, detach);
         return (observer, detach);
@@ -215,11 +224,14 @@ public sealed class ConversationViews
         T? observer = default;
         Action detach = () =>
         {
+            bool empty;
             lock (mount.Observers)
             {
                 mount.Observers.Remove(observer!);
-                if (mount.Observers.Count == 0) RemoveIfCurrent(mount);
+                empty = mount.Observers.Count == 0;
             }
+
+            if (empty) RemoveIfCurrent(mount);
         };
         observer = await create(mount.Value, detach).ConfigureAwait(false);
         return (observer, detach);

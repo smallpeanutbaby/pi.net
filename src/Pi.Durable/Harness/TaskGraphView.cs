@@ -194,11 +194,15 @@ public sealed class TaskGraphView
         blocking.SubscribeBlocked(RefreshBlocked);
         _session.SubscribeClose(() =>
         {
-            object[] observers;
+            object[] observers = [];
             lock (_gate)
             {
                 _closed = true;
-                observers = [.. _mount?.Observers ?? []];
+                if (_mount is { } mount)
+                {
+                    lock (mount.Observers) observers = [.. mount.Observers];
+                }
+
                 _mount = null;
             }
 
@@ -249,7 +253,9 @@ public sealed class TaskGraphView
                 // 最后一个观察者离开即丢弃挂载：新观察者将构建新修订（对齐 TS detach）。
                 lock (_gate)
                 {
-                    if (mount!.Observers.Count == 0 && ReferenceEquals(_mount, mount)) _mount = null;
+                    bool empty;
+                    lock (mount!.Observers) empty = mount.Observers.Count == 0;
+                    if (empty && ReferenceEquals(_mount, mount)) _mount = null;
                 }
             });
             // 挂载构建期间 close 或取消可能已开始；此后不再注册。
@@ -259,10 +265,11 @@ public sealed class TaskGraphView
             }
 
             context.AbortSignal?.ThrowIfCancellationRequested();
+            // 观察者集合始终以自身为锁（detach 在任意线程上、不持 _gate 地移除）；_gate 嵌套在外，顺序固定。
             lock (_gate)
             {
                 _mount = mount;
-                mount.Observers.Add(observer);
+                lock (mount.Observers) mount.Observers.Add(observer);
             }
 
             return (observer, detach);

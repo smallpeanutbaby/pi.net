@@ -188,6 +188,45 @@ public class EnvTests
         Assert.Equal("onetwo", (await env.ReadTextFileAsync("z/out.txt", Ctx)).Value);
     }
 
+    /// <summary>审计回归：对应 Node <c>fs.rename</c>，目标已存在时替换而非失败（JSONL sidecar 回收依赖它）。</summary>
+    [Fact]
+    public async Task FileSystem_RenameReplacesAnExistingDestination()
+    {
+        var (env, _) = await NewEnv();
+        Assert.True((await env.WriteFileAsync("a.txt", "new", Ctx)).IsOk);
+        Assert.True((await env.WriteFileAsync("b.txt", "old", Ctx)).IsOk);
+        Assert.True((await env.RenameFileAsync("a.txt", "b.txt", Ctx)).IsOk);
+        Assert.False((await env.ExistsAsync("a.txt", Ctx)).Value);
+        Assert.Equal("new", (await env.ReadTextFileAsync("b.txt", Ctx)).Value);
+    }
+
+    /// <summary>审计回归（冒烟）：<c>Fsync</c> 路径走的是 <c>Flush(flushToDisk: true)</c>；成功、报缺失、不改内容。</summary>
+    [Fact]
+    public async Task FileSystem_FlushFileSucceedsAndReportsMissingFiles()
+    {
+        var (env, _) = await NewEnv();
+        Assert.True((await env.AppendFileAsync("f.txt", "data", Ctx)).IsOk);
+        Assert.True((await env.FlushFileAsync("f.txt", Ctx)).IsOk);
+        Assert.Equal("data", (await env.ReadTextFileAsync("f.txt", Ctx)).Value);
+        var missing = await env.FlushFileAsync("nope.txt", Ctx);
+        Assert.False(missing.IsOk);
+        Assert.Equal(FileErrorCode.NotFound, missing.Error.Code);
+    }
+
+    /// <summary>
+    /// 审计回归：Windows 的 <see cref="IOException.HResult"/> 是 <c>0x8007xxxx</c>，直接比较 Win32 码永远落到
+    /// Unknown；把文件当目录列出要报 not_directory（对应 Node ENOTDIR）。
+    /// </summary>
+    [Fact]
+    public async Task FileSystem_ListDirOnAFileReportsNotDirectory()
+    {
+        var (env, _) = await NewEnv();
+        Assert.True((await env.WriteFileAsync("file.txt", "x", Ctx)).IsOk);
+        var listing = await env.ListDirAsync("file.txt", Ctx);
+        Assert.False(listing.IsOk);
+        Assert.Equal(FileErrorCode.NotDirectory, listing.Error.Code);
+    }
+
     [Fact]
     public async Task FileSystem_TruncatesAndExtendsToExactSizes()
     {

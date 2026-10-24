@@ -307,4 +307,113 @@ public sealed class HarnessLifecycleTests
             await HarnessTestSupport.CloseQuietlyAsync(harness);
         }
     }
+
+    // ─── 并发：线外触碰调度器状态（审计回归） ─────────────────────────────────
+
+    /// <summary>
+    /// 审计回归：<c>WaitForIdle</c> 的空闲判定曾在调用方线程枚举 <c>_live</c>，与提交并发时抛「集合已修改」。
+    /// 有界压力：写者连续创建任务，读者同时反复等待空闲；每个等待要么挂起、要么已完成，绝不以错误失败。
+    /// </summary>
+    [Fact]
+    public async Task WaitForIdle_SurvivesConcurrentTaskCommits()
+    {
+        var (harness, _, reports) = await HarnessTestSupport.OpenTasksAsync(new MemoryStorage(), []);
+        var waits = new List<Task>();
+        try
+        {
+            var root = await harness.RootAsync(Ctx);
+            // 没有注册定义：任务停在 pending，_live 只增不减，空闲等待永不解析。
+            var unregistered = HarnessTestSupport.DefineTask(
+                "test.unregistered", 1, [("run", (_, _, _) => Task.CompletedTask)]);
+            var stop = 0;
+            var writer = Task.Run(async () =>
+            {
+                for (var i = 0; i < 600; i++) await StartAsync(root, unregistered);
+                Volatile.Write(ref stop, 1);
+            });
+            var readers = Enumerable.Range(0, 4).Select(_ => Task.Run(async () =>
+            {
+                var mine = new List<Task>();
+                for (var i = 0; i < 400 && Volatile.Read(ref stop) == 0; i++)
+                {
+                    mine.Add(harness.WaitForIdleAsync(Ctx));
+                    await Task.Yield();
+                }
+
+                lock (waits) waits.AddRange(mine);
+            })).ToArray();
+            await writer;
+            await Task.WhenAll(readers);
+            // 变更线是 FIFO：哨兵提交完成时，之前排队的每个空闲判定都已跑过。
+            await root.CommitAsync(_ => Task.FromResult<object?>(null), Ctx);
+            Assert.NotEmpty(waits);
+            Assert.DoesNotContain(waits, wait => wait.IsFaulted);
+            Assert.Empty(reports);
+        }
+        finally
+        {
+            await HarnessTestSupport.CloseQuietlyAsync(harness);
+            // 关闭后挂起的等待以 closed 结束；观察掉它们的异常。
+            foreach (var wait in waits)
+            {
+                _ = wait.ContinueWith(static task => _ = task.Exception, System.Threading.Tasks.TaskScheduler.Default);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 审计回归：<c>onWake</c> 的两个投递体曾可交错，旧状态算出的唤醒压在新状态之后送达。宿主回调从不与
+    /// 自己并发，且有任务在跑时最终送达的一定是 <c>Active = true</c>。
+    /// </summary>
+    [Fact]
+    public async Task OnWake_IsSerializedAndSettlesOnTheLatestState()
+    {
+        var registry = Registry.CreateRegistry();
+        var reached = HarnessTestSupport.NewDeferred<Unit>();
+        var gate = HarnessTestSupport.NewDeferred<Unit>();
+        var hang = OneStep("test.wake-hang", async () =>
+        {
+            reached.Resolve(default);
+            await gate.Task;
+        });
+        registry.Install(new HarnessTestSupport.TaskExtension("tasks", [AnyDurableTask.From(hang)]));
+        var wakes = new List<Wake>();
+        var inWake = 0;
+        var overlaps = 0;
+        var options = OpenOptions(registry) with
+        {
+            OnWake = wake =>
+            {
+                if (Interlocked.Increment(ref inWake) > 1) Interlocked.Increment(ref overlaps);
+                lock (wakes) wakes.Add(wake);
+                Interlocked.Decrement(ref inWake);
+            },
+        };
+        var harness = await DurableHarness.OpenAsync(new MemoryStorage(), options, Ctx);
+        try
+        {
+            var root = await harness.RootAsync(Ctx);
+            // 一串提交制造密集的 kick，再放一个挂住的任务进去。
+            for (var i = 0; i < 16; i++)
+            {
+                await root.CommitAsync(
+                    async tx => await tx.CreateConversationAsync(new ConversationOwnership.Ownerless()), Ctx);
+            }
+
+            await StartAsync(root, hang);
+            harness.Resume();
+            await reached.Task;
+            await HarnessTestSupport.WaitForAsync(() => harness.Wake().Active);
+            await HarnessTestSupport.WaitForAsync(() =>
+            {
+                lock (wakes) return wakes.Count > 0 && wakes[^1].Active;
+            });
+            Assert.Equal(0, overlaps);
+            gate.Resolve(default);
+        }
+        finally
+        {
+            await HarnessTestSupport.CloseQuietlyAsync(harness);
+        }
+    }
 }

@@ -632,7 +632,126 @@ public class SessionTests
         lock (frames) Assert.Single(frames);
     }
 
+    /// <summary>
+    /// 审计回归：TS 的 advance 与 drain 在同一线程上串行；端口里 Advance 在变更线、投递在线程池上并发，
+    /// 早期无锁实现会丢帧 / 重复 / 乱序 / 监听器自并发 / Value 停在旧修订。有界压力：串行生产者（如同变更线）
+    /// 推 60 帧，监听器时而让出；每一轮都要求恰好一次、按序、不并发、Value 终于最后一帧。
+    /// </summary>
+    [Fact]
+    public async Task WatchDeliversEveryFrameExactlyOnceInOrderWhileAdvancedConcurrently()
+    {
+        const int trials = 120;
+        const int frames = 60;
+        var expected = Enumerable.Range(1, frames).ToArray();
+        for (var trial = 0; trial < trials; trial++)
+        {
+            var seen = new List<int>();
+            var inListener = 0;
+            var overlaps = 0;
+            var errors = new List<Exception>();
+            var watch = new CommittedWatch<int>(0, () => { }, error =>
+            {
+                lock (errors) errors.Add(error);
+            });
+            watch.Start(async (value, _, _) =>
+            {
+                if (Interlocked.Increment(ref inListener) > 1) Interlocked.Increment(ref overlaps);
+                lock (seen) seen.Add(value);
+                if ((value & 3) == 0) await Task.Yield();
+                Interlocked.Decrement(ref inListener);
+            });
+            await Task.Run(async () =>
+            {
+                for (var i = 1; i <= frames; i++)
+                {
+                    watch.Advance(i, [new DeltaOp.Replace(i)], Ctx);
+                    if ((i & 7) == 0) await Task.Yield();
+                }
+            });
+            try
+            {
+                await WaitUntilAsync(() =>
+                {
+                    lock (seen) return seen.Count >= frames;
+                }, 2000);
+            }
+            catch (TimeoutException)
+            {
+                // 下面的断言给出缺了哪些帧。
+            }
+
+            int[] got;
+            lock (seen) got = [.. seen];
+            Assert.Equal(expected, got);
+            Assert.Equal(0, overlaps);
+            Assert.Equal(frames, watch.Value);
+            Assert.Empty(errors);
+            Assert.IsType<WatchEnd.Stopped>(await watch.Stop());
+        }
+    }
+
+    /// <summary>
+    /// 审计回归：订阅 / 退订（watch 的 detach）在任意线程上改监听器集合，而发布在线上枚举它。
+    /// 并发搅动期间每次提交都必须发布成功。
+    /// </summary>
+    [Fact]
+    public async Task CommitListenersCanBeAddedAndRemovedWhilePublishing()
+    {
+        var test = OpenTestSession();
+        var session = test.Session;
+        var stop = 0;
+        var churn = Task.Run(() =>
+        {
+            while (Volatile.Read(ref stop) == 0)
+            {
+                var subscriptions = Enumerable.Range(0, 8)
+                    .Select(_ => session.SubscribeCommits((_, _) => { }))
+                    .ToArray();
+                foreach (var subscription in subscriptions) subscription.Dispose();
+            }
+        });
+        const int commits = 300;
+        for (var i = 0; i < commits; i++)
+        {
+            await session.CommitAsync(
+                async tx => await tx.CreateConversationAsync(new ConversationOwnership.Ownerless()), Ctx);
+        }
+
+        Volatile.Write(ref stop, 1);
+        await churn;
+        Assert.Equal(commits, test.Publications.Count);
+    }
+
     // ─── 生命周期 ───────────────────────────────────────────────────────────
+
+    /// <summary>记录 beforeClose 开始时关闭监听器是否已经跑过。</summary>
+    private sealed class CloseOrderSession(IStorage storage) : DurableSession(storage)
+    {
+        private int _listenerRan;
+
+        public bool ListenerRanBeforeBeforeClose { get; private set; }
+
+        public void MarkListenerRan() => Interlocked.Exchange(ref _listenerRan, 1);
+
+        protected override Task OnBeforeCloseAsync()
+        {
+            ListenerRanBeforeBeforeClose = Volatile.Read(ref _listenerRan) == 1;
+            return Task.CompletedTask;
+        }
+    }
+
+    /// <summary>
+    /// 审计回归：TS 的 beforeClose 同步前缀与关闭监听器在同一同步块内完成；端口把 beforeClose 丢上线程池，
+    /// 必须先让监听器（Harness 的调度器在这里封印）跑完，否则 join 可能在封印之前快照并漏掉调用。
+    /// </summary>
+    [Fact]
+    public async Task CloseRunsCloseListenersBeforeBeforeClose()
+    {
+        var session = new CloseOrderSession(new MemoryStorage());
+        session.SubscribeClose(session.MarkListenerRan);
+        await session.CloseAsync(Ctx);
+        Assert.True(session.ListenerRanBeforeBeforeClose);
+    }
 
     [Fact]
     public async Task StorageFailurePoisonsTheSession()

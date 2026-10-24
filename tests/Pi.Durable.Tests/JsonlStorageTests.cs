@@ -379,6 +379,120 @@ public class JsonlStorageTests
         }
     }
 
+    private static async Task<DocumentId> CreateCurrentOnlyDocumentAsync(JsonlStorage storage, int value)
+    {
+        await storage.CommitAsync(
+            [new StorageWrite.Conversation(new ConversationRecord { Id = DurableIdConstants.RootConversation })]);
+        var documentId = await storage.MintIdAsync<DocumentId>();
+        await storage.CommitAsync(
+        [
+            new StorageWrite.DocumentCreateWrite(
+                new DocumentCreate
+                {
+                    Id = documentId,
+                    Kind = "state",
+                    Scope = new DocumentScope.ConversationScope(DurableIdConstants.RootConversation),
+                    History = ConversationHistory.Latest,
+                },
+                new DocumentContent.Base(1, new Dictionary<string, object?> { ["value"] = value })),
+        ]);
+        return documentId;
+    }
+
+    private static Task RewriteBaseAsync(JsonlStorage storage, DocumentId documentId, int value)
+        => storage.CommitAsync(
+        [
+            new StorageWrite.DocumentChange(
+                documentId, new DocumentContent.Base(1, new Dictionary<string, object?> { ["value"] = value })),
+        ]);
+
+    /// <summary>
+    /// 审计回归：sidecar 回收把新内容写到 <c>.reclaim</c> 再 rename 覆盖；<c>File.Move</c> 不覆盖已存在的目标，
+    /// 于是回收永远失败（被吞掉）、sidecar 每次重写多一行、<c>.reclaim</c> 留在目录里。
+    /// </summary>
+    [Fact]
+    public async Task CompactsCurrentOnlyDocumentSidecarAcrossRepeatedBaseRewrites()
+    {
+        var (directory, env) = JsonlStorageFixture.Create();
+        try
+        {
+            const int rewrites = 50;
+            var storage = await JsonlStorage.OpenAsync(directory, env);
+            DocumentId documentId;
+            try
+            {
+                documentId = await CreateCurrentOnlyDocumentAsync(storage, 0);
+                for (var i = 1; i <= rewrites; i++) await RewriteBaseAsync(storage, documentId, i);
+
+                var sidecar = Path.Join(directory, $"doc-{documentId.Value}.jsonl");
+                var lines = (await File.ReadAllLinesAsync(sidecar)).Where(line => line.Length > 0).ToArray();
+                Assert.Single(lines);
+                Assert.False(File.Exists(sidecar + ".reclaim"));
+                Assert.DoesNotContain(
+                    Directory.EnumerateFiles(directory),
+                    file => file.EndsWith(".reclaim", StringComparison.Ordinal));
+            }
+            finally
+            {
+                await storage.CloseAsync();
+            }
+
+            var reopened = await JsonlStorage.OpenAsync(directory, env);
+            try
+            {
+                var stored = await reopened.GetDocumentAsync(documentId, new DocumentPoint.Current());
+                Assert.NotNull(stored);
+                Assert.Equal(rewrites, Convert.ToInt32(stored!.Value["value"]));
+            }
+            finally
+            {
+                await reopened.CloseAsync();
+            }
+        }
+        finally
+        {
+            JsonlStorageFixture.Remove(directory);
+        }
+    }
+
+    /// <summary>审计回归（冒烟）：<c>Fsync = true</c> 走 sidecar / 主日志 / 回收临时文件三处刷盘，提交仍能往返。</summary>
+    [Fact]
+    public async Task FsyncOptionFlushesEveryStageAndRoundTripsCommits()
+    {
+        var (directory, env) = JsonlStorageFixture.Create();
+        try
+        {
+            var storage = await JsonlStorage.OpenAsync(directory, env, new JsonlStorageOptions { Fsync = true });
+            DocumentId documentId;
+            try
+            {
+                documentId = await CreateCurrentOnlyDocumentAsync(storage, 0);
+                await RewriteBaseAsync(storage, documentId, 1);
+                await RewriteBaseAsync(storage, documentId, 2);
+            }
+            finally
+            {
+                await storage.CloseAsync();
+            }
+
+            var reopened = await JsonlStorage.OpenAsync(directory, env, new JsonlStorageOptions { Fsync = true });
+            try
+            {
+                var stored = await reopened.GetDocumentAsync(documentId, new DocumentPoint.Current());
+                Assert.NotNull(stored);
+                Assert.Equal(2, Convert.ToInt32(stored!.Value["value"]));
+            }
+            finally
+            {
+                await reopened.CloseAsync();
+            }
+        }
+        finally
+        {
+            JsonlStorageFixture.Remove(directory);
+        }
+    }
+
     [Fact]
     public async Task ReclaimsTerminalTaskSidecar()
     {

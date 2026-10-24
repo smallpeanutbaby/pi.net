@@ -117,14 +117,17 @@ public sealed class LocalExecutionEnv : IExecutionEnv
             case UnauthorizedAccessException:
                 return new FileError(FileErrorCode.PermissionDenied, error.Message, path, error);
             case IOException io:
-                // Windows Win32 错误码经 IOException 的 HResult 传达。
-                return io.HResult switch
+                // Windows Win32 错误码经 IOException 的 HResult 传达，形如 0x8007xxxx（FACILITY_WIN32），
+                // 低 16 位才是错误码；Unix 上 HResult 是原始 errno。
+                return NativeErrorCodeOf(io) switch
                 {
-                    2 /* ERROR_FILE_NOT_FOUND */ or 3 /* ERROR_PATH_NOT_FOUND */ =>
+                    (true, 2 /* ERROR_FILE_NOT_FOUND */ or 3 /* ERROR_PATH_NOT_FOUND */) =>
                         new FileError(FileErrorCode.NotFound, io.Message, path, io),
-                    5 /* ERROR_ACCESS_DENIED */ =>
+                    (true, 5 /* ERROR_ACCESS_DENIED */) =>
                         new FileError(FileErrorCode.PermissionDenied, io.Message, path, io),
-                    267 /* ERROR_DIRECTORY */ =>
+                    (true, 267 /* ERROR_DIRECTORY */) =>
+                        new FileError(FileErrorCode.NotDirectory, io.Message, path, io),
+                    (false, 20 /* ENOTDIR */) =>
                         new FileError(FileErrorCode.NotDirectory, io.Message, path, io),
                     _ => new FileError(FileErrorCode.Unknown, io.Message, path, io),
                 };
@@ -133,6 +136,18 @@ public sealed class LocalExecutionEnv : IExecutionEnv
             default:
                 return new FileError(FileErrorCode.Unknown, error.Message, path, error);
         }
+    }
+
+    /// <summary>
+    /// <see cref="IOException.HResult"/> 里的原生错误码：Windows 的 <c>0x8007xxxx</c> 取低 16 位并标记
+    /// <c>Win32 = true</c>；其他（Unix errno 直通）原样返回并标记 <c>false</c>。
+    /// </summary>
+    private static (bool Win32, int Code) NativeErrorCodeOf(IOException io)
+    {
+        const int facilityWin32 = unchecked((int)0x80070000);
+        return (io.HResult & unchecked((int)0xFFFF0000)) == facilityWin32
+            ? (true, io.HResult & 0xFFFF)
+            : (false, io.HResult);
     }
 
     private static Result<T, FileError>? AbortResult<T>(Context context, string? path = null)
@@ -814,7 +829,10 @@ public sealed class LocalExecutionEnv : IExecutionEnv
             await using (var stream = new FileStream(resolved, FileMode.Open, FileAccess.ReadWrite,
                 FileShare.ReadWrite | FileShare.Delete))
             {
-                await stream.FlushAsync(context.AbortSignal ?? default).ConfigureAwait(false);
+                // 对应 Node fs.fsync：FlushAsync() 只清托管缓冲（这里本就为空），flushToDisk 才让操作系统
+                // 把文件的脏页写到介质（Windows FlushFileBuffers / Unix fsync）。
+                await Task.Run(() => stream.Flush(flushToDisk: true), context.AbortSignal ?? default)
+                    .ConfigureAwait(false);
             }
             return AbortResult<Unit>(context, resolved) ?? Result<Unit, FileError>.Ok(Unit.Value);
         }
@@ -831,7 +849,8 @@ public sealed class LocalExecutionEnv : IExecutionEnv
         if (AbortResult<Unit>(context, destination) is { } aborted) return aborted;
         try
         {
-            File.Move(source, destination);
+            // 对应 Node fs.rename：目标已存在时原子替换（JSONL sidecar 回收依赖这一点）。
+            File.Move(source, destination, overwrite: true);
             return Result<Unit, FileError>.Ok(Unit.Value);
         }
         catch (Exception error)
@@ -882,6 +901,14 @@ public sealed class LocalExecutionEnv : IExecutionEnv
                 if (info.IsOk) infos.Add(info.Value);
             }
             return Result<IReadOnlyList<FileInfo>, FileError>.Ok(infos);
+        }
+        catch (IOException error) when (error is not FileNotFoundException and not DirectoryNotFoundException
+                                        && File.Exists(resolved))
+        {
+            // 对应 Node readdir 的 ENOTDIR。Windows 上枚举一个文件抛的是 ERROR_INVALID_PARAMETER 而非
+            // ERROR_DIRECTORY，光看错误码分不出来；路径存在且不是目录就是这种情况。
+            return Result<IReadOnlyList<FileInfo>, FileError>.Err(
+                new FileError(FileErrorCode.NotDirectory, error.Message, resolved, error));
         }
         catch (Exception error)
         {

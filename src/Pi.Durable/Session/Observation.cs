@@ -14,6 +14,12 @@ internal sealed record WatchFrame<T>(
 /// 每个指向其源的引用，因此一个仍被引用的已停止 watch 只保留其最后一个值。
 /// 对应 TS <c>CommittedWatch&lt;T&gt;</c>（实现 <c>WatchHandle&lt;T&gt;</c>）。
 /// </summary>
+/// <remarks>
+/// TS 在单线程事件循环上运行，<c>advance</c>（提交线）与 <c>drain</c>（微任务）天然串行。端口里
+/// <see cref="Advance"/> 在变更线上、投递在线程池上，二者并发，因此队列与调度标志全部由
+/// <see cref="_gate"/> 保护：同一时刻至多一个投递循环在跑，每帧恰好出队一次、按入队顺序投递，
+/// 监听器从不与自己并发；监听器本身在锁外运行。
+/// </remarks>
 public sealed class CommittedWatch<T> : IWatchHandle<T>
 {
     /// <summary>一个不可用 watch 监听器之后保留的精确已提交帧上限。</summary>
@@ -22,11 +28,12 @@ public sealed class CommittedWatch<T> : IWatchHandle<T>
     /// <summary>退役文档化身的规范终局更新。对应 TS <c>RETIREMENT_OPERATIONS = [["r", null]]</c>。</summary>
     public static readonly IReadOnlyList<DeltaOp> RetirementOperations = [new DeltaOp.Replace(null)];
 
+    private readonly object _gate = new();
     private Action? _detach;
     private Action<Exception>? _report;
     private Func<T>? _replace;
     private readonly TaskCompletionSource<WatchEnd> _closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private readonly List<WatchFrame<T>> _pending = [];
+    private readonly Queue<WatchFrame<T>> _pending = [];
     private T _value;
     private Func<T, IReadOnlyList<DeltaOp>, Context, Task>? _listener;
     private bool _started;
@@ -50,7 +57,13 @@ public sealed class CommittedWatch<T> : IWatchHandle<T>
     }
 
     /// <summary>获取时的修订；最新交付的不可变修订。</summary>
-    public T Value => _value;
+    public T Value
+    {
+        get
+        {
+            lock (_gate) return _value;
+        }
+    }
 
     /// <summary>watch 终止时落定；已运行的回调仍由调用方负责。</summary>
     public Task<WatchEnd> Closed => _closed.Task;
@@ -58,11 +71,14 @@ public sealed class CommittedWatch<T> : IWatchHandle<T>
     /// <summary>安装唯一异步监听器；绝不内联调用。</summary>
     public void Start(Func<T, IReadOnlyList<DeltaOp>, Context, Task> listener)
     {
-        if (_started) throw new InvalidOperationException("Watch is already started");
-        if (_end is not null) throw new InvalidOperationException("Watch is stopped");
-        _started = true;
-        _listener = listener;
-        if (_pending.Count > 0) Schedule();
+        lock (_gate)
+        {
+            if (_started) throw new InvalidOperationException("Watch is already started");
+            if (_end is not null) throw new InvalidOperationException("Watch is stopped");
+            _started = true;
+            _listener = listener;
+            if (_pending.Count > 0) ScheduleLocked();
+        }
     }
 
     /// <summary>幂等地停止未来回调并返回该 watch 的终态结果。</summary>
@@ -75,11 +91,26 @@ public sealed class CommittedWatch<T> : IWatchHandle<T>
     /// <summary>安装取消信号观察。对应 TS <c>observeCancellation(signal)</c>。</summary>
     public void ObserveCancellation(CancellationToken signal)
     {
-        if (_cancellationInstalled)
-            throw new InvalidOperationException("Watch cancellation is already installed");
-        if (_end is not null) return;
-        _cancellationInstalled = true;
-        _cancellationRegistration = signal.Register(Cancel);
+        lock (_gate)
+        {
+            if (_cancellationInstalled)
+                throw new InvalidOperationException("Watch cancellation is already installed");
+            if (_end is not null) return;
+            _cancellationInstalled = true;
+        }
+
+        // 注册在锁外：信号已取消时回调同步运行，而回调（Cancel → Terminate）要拿同一把锁。
+        var registration = signal.Register(Cancel);
+        lock (_gate)
+        {
+            if (_end is null)
+            {
+                _cancellationRegistration = registration;
+                registration = default;
+            }
+        }
+
+        registration.Dispose();
         if (signal.IsCancellationRequested) Cancel();
     }
 
@@ -100,57 +131,71 @@ public sealed class CommittedWatch<T> : IWatchHandle<T>
     /// </summary>
     public void Retire(Context context)
     {
-        if (_end is not null || _retired) return;
-        _retired = true;
-        if (_pending.Count >= MaxPendingWatchFrames) _pending.Clear();
-        _pending.Add(new WatchFrame<T>(default!, RetirementOperations, context, Retires: true));
-        if (_started) Schedule();
+        lock (_gate)
+        {
+            if (_end is not null || _retired) return;
+            _retired = true;
+            if (_pending.Count >= MaxPendingWatchFrames) _pending.Clear();
+            _pending.Enqueue(new WatchFrame<T>(default!, RetirementOperations, context, Retires: true));
+            if (_started) ScheduleLocked();
+        }
     }
 
     /// <summary>推进 watch：入队一帧（超限则整批折叠）。对应 TS <c>advance</c>。</summary>
     public void Advance(T value, IReadOnlyList<DeltaOp> ops, Context context)
     {
-        if (_end is not null || _retired) return;
-        if (_pending.Count >= MaxPendingWatchFrames)
+        lock (_gate)
         {
-            _pending.Clear();
-            var replacement = _replace is not null ? _replace() : value;
-            _pending.Add(new WatchFrame<T>(replacement, [new DeltaOp.Replace(replacement)], context));
+            if (_end is not null || _retired) return;
+            if (_pending.Count >= MaxPendingWatchFrames)
+            {
+                _pending.Clear();
+                var replacement = _replace is not null ? _replace() : value;
+                _pending.Enqueue(new WatchFrame<T>(replacement, [new DeltaOp.Replace(replacement)], context));
+            }
+            else
+            {
+                _pending.Enqueue(new WatchFrame<T>(value, ops, context));
+            }
+
+            if (_started) ScheduleLocked();
         }
-        else
-        {
-            _pending.Add(new WatchFrame<T>(value, ops, context));
-        }
-        if (_started) Schedule();
     }
 
-    private void Schedule()
+    /// <summary>持有 <see cref="_gate"/> 时调用：没有投递循环在跑或已排期时排一个。</summary>
+    private void ScheduleLocked()
     {
         if (_scheduled || _running || _end is not null) return;
         _scheduled = true;
         // 设计差异：TS 用 queueMicrotask 保证「当前同步栈结束之后」投递；C# 用线程池任务近似
-        // （投递仍严格晚于当前同步段、帧序不变），时序粒度不同但观察语义一致。
-        _ = Task.Run(async () =>
-        {
-            _scheduled = false;
-            await DrainAsync().ConfigureAwait(false);
-        });
+        // （投递仍严格晚于当前同步段），时序粒度不同但观察语义一致。帧序与「监听器不与自己并发」
+        // 由 _gate 与 _running 保证：Advance 与投递在不同线程上，但同一时刻只有一个 DrainAsync。
+        _ = Task.Run(DrainAsync);
     }
 
     private async Task DrainAsync()
     {
-        if (_running || _end is not null || !_started) return;
-        _running = true;
+        lock (_gate)
+        {
+            _scheduled = false;
+            if (_running || _end is not null || !_started) return;
+            _running = true;
+        }
+
         try
         {
-            while (_end is null)
+            while (true)
             {
-                if (_pending.Count == 0) break;
-                var frame = _pending[0];
-                _pending.RemoveAt(0);
-                var listener = _listener;
-                if (listener is null) break;
-                _value = frame.Value;
+                WatchFrame<T> frame;
+                Func<T, IReadOnlyList<DeltaOp>, Context, Task> listener;
+                lock (_gate)
+                {
+                    if (_end is not null || _listener is null || _pending.Count == 0) break;
+                    frame = _pending.Dequeue();
+                    listener = _listener;
+                    _value = frame.Value;
+                }
+
                 var deliveryContext = ContextSignals.WithoutAbortSignal(frame.Context);
                 try
                 {
@@ -158,13 +203,23 @@ public sealed class CommittedWatch<T> : IWatchHandle<T>
                 }
                 catch (Exception error)
                 {
-                    if (_end is null)
+                    Action<Exception>? report;
+                    bool live;
+                    lock (_gate)
                     {
-                        _report?.Invoke(error);
+                        live = _end is null;
+                        report = live ? _report : null;
+                    }
+
+                    if (live)
+                    {
+                        report?.Invoke(error);
                         Terminate(new WatchEnd.ListenerError(error));
                     }
+
                     break;
                 }
+
                 if (frame.Retires)
                 {
                     Terminate(new WatchEnd.Retired());
@@ -174,27 +229,38 @@ public sealed class CommittedWatch<T> : IWatchHandle<T>
         }
         finally
         {
-            _running = false;
-            if (_end is null && _pending.Count > 0) Schedule();
+            lock (_gate)
+            {
+                _running = false;
+                if (_end is null && _pending.Count > 0) ScheduleLocked();
+            }
         }
     }
 
     /// <summary>
     /// 只结束一次：脱钩、丢弃待发帧与每个指向源的引用，并落定 <see cref="Closed"/>。
-    /// 已在运行的回调继续运行。
+    /// 已在运行的回调继续运行。detach 与取消注册的释放都在锁外：前者会拿源的锁，后者
+    /// 要等正在运行的取消回调（它也要拿本锁）结束。
     /// </summary>
     private void Terminate(WatchEnd end)
     {
-        if (_end is not null) return;
-        _end = end;
-        var detach = _detach;
-        _detach = null;
-        _report = null;
-        _replace = null;
-        _listener = null;
-        _pending.Clear();
-        _cancellationRegistration.Dispose();
-        _cancellationRegistration = default;
+        Action? detach;
+        CancellationTokenRegistration registration;
+        lock (_gate)
+        {
+            if (_end is not null) return;
+            _end = end;
+            detach = _detach;
+            _detach = null;
+            _report = null;
+            _replace = null;
+            _listener = null;
+            _pending.Clear();
+            registration = _cancellationRegistration;
+            _cancellationRegistration = default;
+        }
+
+        registration.Dispose();
         detach?.Invoke();
         _closed.TrySetResult(end);
     }
